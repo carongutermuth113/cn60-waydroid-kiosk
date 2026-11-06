@@ -7,6 +7,8 @@
 #   sudo ./cn60-waydroid-setup.sh                    install; if already installed, add only what is new
 #   sudo ./cn60-waydroid-setup.sh --no-upgrade       same, but skip the Debian/Android upgrade
 #   sudo ./cn60-waydroid-setup.sh --force            redo every step, even ones already done
+#   sudo ./cn60-waydroid-setup.sh --aurora           install Aurora Store without asking
+#   sudo ./cn60-waydroid-setup.sh --no-aurora        do not install Aurora Store, do not ask
 #   sudo ./cn60-waydroid-setup.sh --uninstall        remove everything this script added
 #   sudo ./cn60-waydroid-setup.sh --uninstall --yes  same, without the confirmation prompt
 #
@@ -15,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=8               # bump when the script changes
+SCRIPT_VERSION=9               # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -26,6 +28,7 @@ MASKED=$STATE/masked           # units this script masked
 DISABLED=$STATE/disabled       # units this script disabled
 ENABLED=$STATE/enabled         # units this script enabled (besides its own)
 USER_FILE=$STATE/user
+OPTIONS=$STATE/options         # answers to install questions (asked once)
 export DEBIAN_FRONTEND=noninteractive
 APT=(apt-get -y -o DPkg::Lock::Timeout=600
      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
@@ -39,12 +42,15 @@ MODE=install
 ASSUME_YES=0
 FORCE=0
 UPGRADE=1
+AURORA_FLAG=""
 for arg in "$@"; do
     case "$arg" in
         --uninstall)  MODE=uninstall ;;
         --yes)        ASSUME_YES=1 ;;
         --force)      FORCE=1 ;;
         --no-upgrade) UPGRADE=0 ;;
+        --aurora)     AURORA_FLAG=yes ;;
+        --no-aurora)  AURORA_FLAG=no ;;
         -h|--help)    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
         *)            die "Unknown option: $arg" ;;
     esac
@@ -106,6 +112,37 @@ set_kv() {
     fi
 }
 
+# Install questions: asked once, answer kept in /etc/cn60/options.
+opt_get() { sed -n "s/^$1=//p" "$OPTIONS" 2>/dev/null | tail -n1; }
+opt_set() {
+    mkdir -p "$STATE"; touch "$OPTIONS"
+    if grep -q "^$1=" "$OPTIONS"; then sed -i "s|^$1=.*|$1=$2|" "$OPTIONS"
+    else echo "$1=$2" >> "$OPTIONS"; fi
+}
+
+ask_options() {
+    [[ -n $AURORA_FLAG ]] && opt_set AURORA_STORE "$AURORA_FLAG"
+    if [[ -z "$(opt_get AURORA_STORE)" ]]; then
+        if [[ -t 0 && $ASSUME_YES -eq 0 ]]; then
+            cat <<'EOM'
+
+Aurora Store is an open-source app store that downloads apps from Google Play
+without Google's own apps. You can sign in anonymously. Apps that need Google
+Play Services (some games, banking, Google apps) may not work.
+EOM
+            local a
+            read -rp "Install Aurora Store in Android? [Y/n] " a
+            case "$a" in
+                n|N|no|NO) opt_set AURORA_STORE no ;;
+                *)         opt_set AURORA_STORE yes ;;
+            esac
+            CHANGES+=("Aurora Store: $(opt_get AURORA_STORE)")
+        else
+            echo "  Aurora Store: not asked (no keyboard on this run). Later: sudo cn60-apps aurora"
+        fi
+    fi
+}
+
 unit_state() { systemctl is-enabled "$1" 2>/dev/null || true; }
 unit_exists() { [[ -n "$(systemctl list-unit-files "$1" --no-legend 2>/dev/null)" ]]; }
 
@@ -159,7 +196,8 @@ do_uninstall() {
           /etc/systemd/system/cn60-check.timer
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
           /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
-          /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /etc/update-motd.d/90-cn60
+          /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /usr/local/bin/cn60-apps \
+          /etc/update-motd.d/90-cn60
     rm -rf /usr/local/lib/cn60 /var/lib/cn60
 
     log "Reverting OS tweaks"
@@ -605,12 +643,13 @@ menu_tv_power() {
 while true; do
     status_line=$(cat /etc/cn60/status 2>/dev/null)
     choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
-        --menu "${status_line:-Everything is up to date.}" 21 70 10 \
+        --menu "${status_line:-Everything is up to date.}" 22 70 11 \
         resolution "Change display resolution" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
         remote     "See this screen on a PC (scrcpy)" \
+        apps       "Install Aurora Store (Google Play client)" \
         restart    "Restart the Android kiosk" \
         check      "Check for updates" \
         update     "Update script + Debian + Android now" \
@@ -622,6 +661,9 @@ while true; do
         tv)         menu_tv_power ;;
         info)       menu_info ;;
         remote)     clear; /usr/local/bin/cn60-remote; read -rp "Press Enter to return to the menu " _ ;;
+        apps)       if whiptail --yesno "Install Aurora Store?\n\nIt downloads apps from Google Play without Google's apps. Apps that need Google Play Services may not work." 11 64; then
+                        clear; /usr/local/bin/cn60-apps aurora; read -rp "Press Enter to return to the menu " _
+                    fi ;;
         restart)    systemctl restart waydroid-kiosk.service ;;
         check)      clear; /usr/local/bin/cn60-check --no-notify; read -rp "Press Enter to return to the menu " _ ;;
         update)     clear; /usr/local/bin/cn60-update; read -rp "Press Enter to return to the menu " _ ;;
@@ -656,6 +698,11 @@ REPO=carongutermuth113/cn60-waydroid-kiosk; BRANCH=main; GITHUB_TOKEN=""; NOTIFY
 LIB=/var/lib/cn60
 mkdir -p "$LIB"
 installed="$(cat /etc/cn60/version 2>/dev/null || echo 0)"
+
+# Apps queued while Android was not running (for example Aurora Store on a fresh install).
+if [[ -s /etc/cn60/pending-apps && -x /usr/local/bin/cn60-apps ]]; then
+    /usr/local/bin/cn60-apps pending >/dev/null 2>&1 || true
+fi
 
 # 1. Newest setup script on GitHub (API works for public repos, and private ones with a token).
 latest=""
@@ -774,6 +821,79 @@ On your PC (Windows: double-click windows\cn60-screen.bat from the GitHub repo),
 The first time, the TV may ask "Allow USB debugging?": tick "Always allow" and press Allow.
 EOF
 CN60_REMOTE_EOF
+
+    # Android app installer (Aurora Store); queues installs while Android is not running.
+    put_file /usr/local/bin/cn60-apps 755 <<'CN60_APPS_EOF'
+#!/usr/bin/env bash
+# CN60 Android app installer.
+#   sudo cn60-apps aurora    install Aurora Store (Google Play client) from F-Droid
+#   sudo cn60-apps pending   install apps that were queued while Android was not running
+#   sudo cn60-apps list      list installed Android apps
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-apps $*"; exit 1; }
+PENDING=/etc/cn60/pending-apps
+KUSER="$(cat /etc/cn60/user)"
+UIDN="$(id -u "$KUSER")"
+as_user() { runuser -u "$KUSER" -- env XDG_RUNTIME_DIR="/run/user/$UIDN" "$@"; }
+android_up() { waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING'; }
+has_pkg() { as_user waydroid app list 2>/dev/null | grep -q "packageName: $1\$"; }
+queue() {
+    grep -qx "$1" "$PENDING" 2>/dev/null || echo "$1" >> "$PENDING"
+    echo "Android is not running. $2 is queued and installs automatically once it is (15 min after boot, then daily)."
+}
+unqueue() {
+    [[ -f $PENDING ]] || return 0
+    sed -i "/^$1\$/d" "$PENDING"
+    [[ -s $PENDING ]] || rm -f "$PENDING"
+}
+
+# install_fdroid <queue key> <display name> <package id>: newest suggested build from f-droid.org
+install_fdroid() {
+    local key=$1 name=$2 pkg=$3 code tmp
+    if ! android_up; then queue "$key" "$name"; return 0; fi
+    if has_pkg "$pkg"; then
+        echo "$name is already installed (it updates itself)."
+        unqueue "$key"; return 0
+    fi
+    code="$(curl -fsSL --max-time 30 "https://f-droid.org/api/v1/packages/$pkg" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["suggestedVersionCode"])' 2>/dev/null)"
+    [[ $code =~ ^[0-9]+$ ]] || { echo "Could not get $name's version from F-Droid."; return 1; }
+    tmp="$(mktemp --suffix=.apk)"
+    echo "Downloading $name (F-Droid build $code)..."
+    if ! curl -fL --max-time 600 -o "$tmp" "https://f-droid.org/repo/${pkg}_${code}.apk" \
+       || [[ "$(head -c2 "$tmp")" != PK ]]; then
+        rm -f "$tmp"; echo "Download of $name failed."; return 1
+    fi
+    chmod 644 "$tmp"
+    echo "Installing $name in Android..."
+    if ! as_user waydroid app install "$tmp"; then
+        rm -f "$tmp"; echo "Install of $name failed."; return 1
+    fi
+    rm -f "$tmp"
+    sleep 3
+    if has_pkg "$pkg"; then
+        unqueue "$key"; echo "$name installed. Open it from the Android app drawer."
+    else
+        echo "$name was sent to Android but does not show up yet; check the TV screen."
+    fi
+}
+
+case "${1:-}" in
+    aurora)  install_fdroid aurora "Aurora Store" com.aurora.store ;;
+    pending)
+        [[ -s $PENDING ]] || exit 0
+        android_up || exit 0
+        rc=0
+        while read -r app; do
+            case "$app" in
+                aurora) install_fdroid aurora "Aurora Store" com.aurora.store || rc=1 ;;
+            esac
+        done < <(cat "$PENDING")
+        exit $rc ;;
+    list)    as_user waydroid app list ;;
+    *)       sed -n '2,5p' "$0"; exit 1 ;;
+esac
+CN60_APPS_EOF
 
     # Shown when you log in over SSH or on a console.
     put_file /etc/update-motd.d/90-cn60 755 <<'EOF'
@@ -986,6 +1106,9 @@ do_install() {
         log "Already installed (version $prev). Script version $SCRIPT_VERSION: adding only what is new."
     fi
 
+    # Questions first, so the rest can run unattended.
+    ask_options
+
     # Always-checked steps: each one is idempotent and only changes what is missing.
     install_packages
     [[ $UPGRADE -eq 1 ]] && upgrade_debian
@@ -1008,6 +1131,11 @@ do_install() {
         log "Upgrading the Waydroid Android image"
         /usr/local/bin/cn60-update --no-restart --no-self-update >/dev/null 2>&1 \
             && echo "  done" || warn "Android image upgrade failed; run 'sudo cn60-update' to see why."
+    fi
+
+    if [[ "$(opt_get AURORA_STORE)" == yes ]]; then
+        log "Checking Aurora Store"
+        /usr/local/bin/cn60-apps aurora || warn "Aurora Store install failed; retry with: sudo cn60-apps aurora"
     fi
 
     log "Checking the boot target"
@@ -1048,6 +1176,7 @@ Next steps:
   - Update now:               sudo cn60-update
   - Check for updates:        sudo cn60-check
   - See the screen on a PC:   sudo cn60-remote
+  - Install Aurora Store:     sudo cn60-apps aurora
   - Self-update settings:     sudo nano /etc/cn60/update.conf
   - Weekly auto-update:       systemctl list-timers cn60-update.timer
   - Reboot to start the kiosk (and apply boot tweaks).

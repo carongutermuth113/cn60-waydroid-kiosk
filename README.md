@@ -27,6 +27,7 @@ install. Run it again later to add only what is new.
 | **SSH** | OpenSSH server enabled. Root login over SSH is disabled |
 | **Updates** | Daily security updates, plus a weekly full Debian + Android image upgrade |
 | **Self-update** | Checks this GitHub repo daily and installs new script versions in the weekly update |
+| **Aurora Store** | Optional (the installer asks): open-source Google Play client, from F-Droid |
 | **Remote screen** | See and control Android from a PC with scrcpy, through an SSH tunnel |
 | **Notifications** | Android notification when a new script version, Debian updates or a reboot is waiting |
 | **OS tuning** | zram swap, journal size cap, no suspend, quiet fast boot, unneeded services off |
@@ -77,6 +78,8 @@ sed -i 's/\r$//' cn60-waydroid-setup.sh
 sudo ./cn60-waydroid-setup.sh                    install; if already installed, add only what is new
 sudo ./cn60-waydroid-setup.sh --no-upgrade       same, but skip the Debian/Android upgrade
 sudo ./cn60-waydroid-setup.sh --force            redo every step, even ones already done
+sudo ./cn60-waydroid-setup.sh --aurora           install Aurora Store without asking
+sudo ./cn60-waydroid-setup.sh --no-aurora        do not install Aurora Store, do not ask
 sudo ./cn60-waydroid-setup.sh --uninstall        remove everything this script added
 sudo ./cn60-waydroid-setup.sh --uninstall --yes  same, without the confirmation prompt
 ./cn60-waydroid-setup.sh --help                  show usage
@@ -114,6 +117,7 @@ power on
 
 ### What the installer does, step by step
 
+0. **Questions.** Asks once whether to install Aurora Store, and keeps the answer in `/etc/cn60/options`, so the rest runs unattended.
 1. **Platform check.** Stops if the machine is not x86_64. Warns if it is not Debian 13.
 2. **Packages.** Installs only the missing ones and records exactly which ones it added, so uninstall removes only those.
 3. **Debian upgrade.** `apt full-upgrade`. Skip it with `--no-upgrade`.
@@ -130,6 +134,7 @@ power on
    - `self-update`: enables the daily `cn60-check.timer`
    - `network-clash`: disables `dnsmasq.service` and `lxc-net.service`, which Waydroid does not need
 10. **Android image upgrade.** `waydroid upgrade`.
+10. **Aurora Store** (if you said yes). Installs it now if Android is running, otherwise queues it.
 11. **Boot target.** Enables seatd, disables any desktop login manager, and sets `graphical-kiosk.target` as the default.
 12. **Summary.** Prints what changed this run, the box's IP for SSH, and next steps.
 
@@ -163,6 +168,7 @@ sudo cn60-settings
 | `tv` | TV on / standby over HDMI-CEC |
 | `info` | IP address and SSH status |
 | `remote` | How to see this screen on a PC (scrcpy) |
+| `apps` | Install Aurora Store |
 | `restart` | Restart Android |
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
@@ -214,6 +220,34 @@ ssh <your-user>@<box-ip>
 
 The installer prints the IP at the end, and the settings menu shows it under
 `info`. Settings live in `/etc/ssh/sshd_config.d/90-cn60.conf`.
+
+---
+
+## Aurora Store (apps from Google Play)
+
+The Android image is VANILLA (no Google apps), so there is no Play Store.
+[Aurora Store](https://f-droid.org/packages/com.aurora.store/) is an
+open-source Play Store client. It downloads the same apps from Google Play,
+and you can sign in **anonymously**.
+
+- The installer **asks once** (`Install Aurora Store in Android? [Y/n]`) and
+  remembers the answer. Use `--aurora` / `--no-aurora` to answer up front.
+  Runs with no keyboard (the weekly self-update) never ask. They print how to
+  install it later.
+- It comes from **F-Droid** (newest suggested build, over HTTPS).
+- If Android is not running yet (fresh install, before the first reboot), the
+  install is **queued** and done automatically by the update check 15 minutes
+  after boot.
+- Once installed, Aurora Store updates itself.
+
+```bash
+sudo cn60-apps aurora     # install now (or menu: apps)
+sudo cn60-apps list       # installed Android apps
+```
+
+Limits: apps that need Google Play Services (many Google apps, some games,
+banking, Netflix-style DRM apps) may refuse to run. ARM-only apps work through
+the libndk translation, but not all of them.
 
 ---
 
@@ -394,6 +428,9 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-update` | Updater (script from GitHub, Debian, Android) |
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
 | `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
+| `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store) |
+| `/etc/cn60/options` | Answers to install questions (`AURORA_STORE=yes/no`) |
+| `/etc/cn60/pending-apps` | Apps waiting for Android to be running |
 | `/usr/local/lib/cn60/cn60-waydroid-setup.sh` | Installed copy of this script |
 | `/etc/cn60/update.conf` | Self-update settings (repo, token, auto-apply, notify) |
 | `/etc/cn60/status` | Current "updates waiting" message |
