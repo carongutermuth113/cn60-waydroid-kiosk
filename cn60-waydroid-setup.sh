@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=12              # bump when the script changes
+SCRIPT_VERSION=13              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -1124,6 +1124,15 @@ grep -qE 'Out of memory: Killed process|oom-kill:' <<< "$src" && \
 grep -qiE 'libEGL|libGLES|gralloc|mesa|iris|i965|SIGSEGV' <<< "$src" && \
     hints+=("A native crash (possibly graphics/GPU). Send this report for a closer look.")
 
+if grep -q 'was already used. If you are using LazyColumn' <<< "$src" && grep -q 'com.aurora.store' <<< "$src"; then
+    hints+=("Aurora Store bug: its home feed lists the same app twice and it crashes (Aurora issue #1611, https://gitlab.com/AuroraOSS/AuroraStore/-/issues/1611). Not the box. Workaround: open Aurora and tap Search right away, before the home screen loads. A later Aurora version should fix it.")
+fi
+if [[ ${#hints[@]} -eq 0 ]] && grep -q 'FATAL EXCEPTION' <<< "$src"; then
+    app="$(grep -m1 -o 'Process: [^,]*' <<< "$src" | cut -d' ' -f2)"
+    exc="$(grep -A2 'FATAL EXCEPTION' <<< "$src" | grep -m1 -oE '[a-zA-Z0-9_.]+(Exception|Error)[^:]*(: .{0,120})?')"
+    hints+=("${app:-An app} crashed because of a bug in the app itself (${exc:-Java exception}). Memory, ARM translation and Play Services are not the cause. Look for an app update or report it to the app's developer.")
+fi
+
 {
     echo "$report"
     echo; echo "== What this probably means"
@@ -1216,15 +1225,11 @@ CN60_UPDATE_EOF
     # Runs as root: sets resolution, powers on the TV, then hands off to the user.
     put_file /usr/local/bin/cn60-kiosk-start 755 <<'EOF'
 #!/bin/sh
-# Root part of the kiosk: apply resolution, wake the TV, start the user session.
-CONF=/etc/cn60/display.conf
-[ -r "$CONF" ] && . "$CONF"
-WIDTH="${WIDTH:-1920}"; HEIGHT="${HEIGHT:-1080}"
+# Root part of the kiosk: wake the TV, start the user session.
 KUSER="$(cat /etc/cn60/user)"
 UID_NUM="$(id -u "$KUSER")"
 
-waydroid prop set persist.waydroid.width "$WIDTH" || echo "cn60: could not set width" >&2
-waydroid prop set persist.waydroid.height "$HEIGHT" || echo "cn60: could not set height" >&2
+# Resolution is applied by cn60-kiosk-user: waydroid prop set only works while Android runs.
 echo 'on 0' | timeout 10 cec-client -s -d 1 >/dev/null 2>&1 || true   # best effort, never blocks boot
 
 systemctl start "user@${UID_NUM}.service" || true
@@ -1236,14 +1241,32 @@ EOF
     # Runs as the normal user inside cage: start Waydroid and show it fullscreen.
     put_file /usr/local/bin/cn60-kiosk-user 755 <<'EOF'
 #!/bin/sh
-# Start Android, wait until it is really up (slow with 4 GB RAM), then show it fullscreen.
-waydroid session stop >/dev/null 2>&1 || true
-waydroid session start >/dev/null 2>&1 &
-i=0
-while [ "$i" -lt 120 ]; do
-    waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && break
-    sleep 1; i=$((i + 1))
-done
+# Start Android, wait until it is really up (slow with 4 GB RAM), apply the resolution from
+# /etc/cn60/display.conf, then show Android fullscreen.
+CONF=/etc/cn60/display.conf
+[ -r "$CONF" ] && . "$CONF"
+WIDTH="${WIDTH:-1920}"; HEIGHT="${HEIGHT:-1080}"
+wait_up() {
+    i=0
+    while [ "$i" -lt 120 ]; do
+        waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+start_android() {
+    waydroid session stop >/dev/null 2>&1 || true
+    waydroid session start >/dev/null 2>&1 &
+    wait_up
+}
+start_android
+# Resolution props can only be set while Android runs, and apply at its next start:
+# if they differ, set them and restart Android once.
+if [ "$(waydroid prop get persist.waydroid.width 2>/dev/null)" != "$WIDTH" ] ||
+   [ "$(waydroid prop get persist.waydroid.height 2>/dev/null)" != "$HEIGHT" ]; then
+    waydroid prop set persist.waydroid.width "$WIDTH" &&
+        waydroid prop set persist.waydroid.height "$HEIGHT" && start_android
+fi
 exec waydroid show-full-ui
 EOF
 

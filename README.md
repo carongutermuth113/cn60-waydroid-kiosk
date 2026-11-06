@@ -541,6 +541,15 @@ closes, run `sudo cn60-crashlog --clear`, open the app until it closes, then
   it needs a GApps or microG image.
 - *ARM translation*: re-run `sudo /usr/local/lib/cn60/cn60-waydroid-setup.sh --force`.
 - *RAM was full*: use 1080p instead of 4K and keep few apps open.
+- *bug in the app itself* (a Java exception): not the box; update the app or report it.
+  Example: Aurora Store 4.8.4 crashes on its home screen when the feed lists an app
+  twice ([issue #1611](https://gitlab.com/AuroraOSS/AuroraStore/-/issues/1611)).
+  Workaround: tap Search right after opening Aurora.
+
+**Resolution setting had no effect at boot (v12 and older)**
+`waydroid prop set` only works while Android runs, so the boot-time setting
+failed. From v13 the kiosk sets it after Android starts and restarts Android once
+when it changed.
 
 **Black screen / kiosk keeps restarting**
 Check `journalctl -u waydroid-kiosk -b` and `sudo waydroid log`. After 3
