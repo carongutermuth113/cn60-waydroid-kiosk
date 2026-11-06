@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=9               # bump when the script changes
+SCRIPT_VERSION=10              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -205,7 +205,8 @@ do_uninstall() {
           /etc/systemd/journald.conf.d/90-cn60.conf \
           /etc/systemd/system.conf.d/90-cn60.conf \
           /etc/apt/apt.conf.d/52cn60-unattended \
-          /etc/ssh/sshd_config.d/90-cn60.conf
+          /etc/ssh/sshd_config.d/90-cn60.conf \
+          /etc/wireplumber/wireplumber.conf.d/80-cn60-bluetooth.conf
     [[ -r $MASKED ]]   && while read -r u; do [[ -n $u ]] && systemctl unmask "$u" 2>/dev/null || true; done < "$MASKED"
     [[ -r $DISABLED ]] && while read -r u; do [[ -n $u ]] && systemctl enable "$u" 2>/dev/null || true; done < "$DISABLED"
     [[ -r $ENABLED ]]  && while read -r u; do [[ -n $u ]] && systemctl disable "$u" 2>/dev/null || true; done < "$ENABLED"
@@ -446,6 +447,25 @@ fix_network_clash() {
     return 0
 }
 
+# ---- Bluetooth audio fix (one-time step)
+# WirePlumber only offers Bluetooth audio to a user that has an active logind seat session.
+# The kiosk runs without one, so headphones/speakers fail with
+# "br-connection-profile-unavailable". Turn seat monitoring off for Bluetooth.
+fix_bt_audio() {
+    log "Allowing Bluetooth audio without a desktop login (WirePlumber)"
+    put_file /etc/wireplumber/wireplumber.conf.d/80-cn60-bluetooth.conf 644 <<'EOF'
+# CN60 kiosk: Bluetooth audio without a logind seat session (removed on uninstall)
+wireplumber.profiles = {
+  main = {
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+EOF
+    systemctl --user -M "$KUSER@" restart wireplumber.service pipewire-pulse.service >/dev/null 2>&1 \
+        || echo "  WirePlumber restarts with the next kiosk restart or reboot."
+    return 0
+}
+
 # ---- Self-update checks + Android notifications (one-time step)
 setup_self_update() {
     log "Turning on daily update checks (new script version on GitHub, Debian updates)"
@@ -574,7 +594,17 @@ bt_run() {    # show the commands' output on screen (passkeys appear here)
     clear
     echo "$1"; echo
     shift
-    for c in "$@"; do echo "\$ bluetoothctl $c"; eval "bluetoothctl $c"; echo; done
+    local out
+    for c in "$@"; do
+        echo "\$ bluetoothctl $c"
+        out=$(eval "bluetoothctl $c" 2>&1); echo "$out"; echo
+        if [[ $out == *profile-unavailable* ]]; then
+            echo "Hint: no Debian service can handle this device. Headphones/speakers need the"
+            echo "audio server: run 'sudo cn60-update' (script v10+) and reboot. Phones and PCs"
+            echo "cannot be connected this way at all."
+            echo
+        fi
+    done
     read -rp "Press Enter to continue " _
 }
 
@@ -1126,6 +1156,7 @@ do_install() {
     run_step ssh             1 setup_ssh
     run_step self-update     1 setup_self_update
     run_step network-clash   1 fix_network_clash
+    run_step bt-audio        1 fix_bt_audio
 
     if [[ $UPGRADE -eq 1 ]]; then
         log "Upgrading the Waydroid Android image"

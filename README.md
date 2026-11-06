@@ -133,6 +133,7 @@ power on
    - `ssh`: sshd hardening drop-in, service enabled
    - `self-update`: enables the daily `cn60-check.timer`
    - `network-clash`: disables `dnsmasq.service` and `lxc-net.service`, which Waydroid does not need
+   - `bt-audio`: lets WirePlumber handle Bluetooth audio without a desktop login
 10. **Android image upgrade.** `waydroid upgrade`.
 10. **Aurora Store** (if you said yes). Installs it now if Android is running, otherwise queues it.
 11. **Boot target.** Enables seatd, disables any desktop login manager, and sets `graphical-kiosk.target` as the default.
@@ -510,6 +511,13 @@ Fixed in script version 7. The system-wide `dnsmasq` daemon and LXC's
 default bridge (`lxc-net`) are not used by Waydroid (it runs its own
 `waydroid0` bridge) and fight over port 53. The script disables both. By hand:
 `sudo systemctl disable --now dnsmasq lxc-net && sudo systemctl restart waydroid-container`.
+
+**Bluetooth: `Failed to connect: org.bluez.Error.Failed br-connection-profile-unavailable`**
+No Debian service accepted the device. For headphones/speakers this is because
+WirePlumber only offers Bluetooth audio to a desktop login, and the kiosk has
+none. Script v10 turns that off (`/etc/wireplumber/wireplumber.conf.d/80-cn60-bluetooth.conf`).
+Update, reboot, then `connect` again. Phones and PCs cannot be "connected" to
+the box this way at all.
 
 **Remote screen: `adb connect` fails or scrcpy says "device unauthorized"**
 Run `sudo cn60-remote` on the box. It turns on network ADB inside Android if
