@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=11              # bump when the script changes
+SCRIPT_VERSION=12              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -1085,7 +1085,10 @@ report="$(
     free -h; swapon --show
     echo "memory pressure: $(head -n1 /proc/pressure/memory 2>/dev/null)"
     echo; echo "== Debian out-of-memory kills (this boot)"
-    journalctl -k -b --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 15
+    # Real kernel OOM kills only (Android's "libprocessgroup: Successfully killed" lines are normal app exits).
+    ooms="$(journalctl -k -b --no-pager 2>/dev/null | grep -E 'Out of memory: Killed process|oom-kill:|invoked oom-killer' \
+            | grep -v libprocessgroup | tail -n 15)"
+    echo "${ooms:-none}"
     if [[ $android_up -eq 1 ]]; then
         echo; echo "== Android settings"
         for p in ro.product.cpu.abilist ro.dalvik.vm.native.bridge dalvik.vm.heapgrowthlimit \
@@ -1116,7 +1119,7 @@ grep -qi 'OutOfMemoryError' <<< "$src" && \
     hints+=("An app ran out of its Java memory limit (OutOfMemoryError).")
 grep -qiE 'lowmemorykiller|am_kill' <<< "$src" && \
     hints+=("Android closed apps because RAM was full. Use 1080p instead of 4K (Settings > resolution) and keep few apps open.")
-grep -qiE 'oom-kill|out of memory' <<< "$src" && \
+grep -qE 'Out of memory: Killed process|oom-kill:' <<< "$src" && \
     hints+=("Debian ran out of memory and killed processes. Check that swap is on (the 'Debian memory' section above should list zram and /cn60.swap).")
 grep -qiE 'libEGL|libGLES|gralloc|mesa|iris|i965|SIGSEGV' <<< "$src" && \
     hints+=("A native crash (possibly graphics/GPU). Send this report for a closer look.")
