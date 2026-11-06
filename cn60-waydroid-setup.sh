@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=5               # bump when the script changes
+SCRIPT_VERSION=6               # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -638,18 +638,32 @@ latest=""
 tmp="$(mktemp)"
 hdr=(-H "Accept: application/vnd.github.raw")
 [[ -n $GITHUB_TOKEN ]] && hdr+=(-H "Authorization: Bearer $GITHUB_TOKEN")
-if curl -fsSL --max-time 60 "${hdr[@]}" \
-        "https://api.github.com/repos/$REPO/contents/cn60-waydroid-setup.sh?ref=$BRANCH" -o "$tmp" \
-   && bash -n "$tmp" 2>/dev/null; then
-    latest="$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9]*\).*/\1/p' "$tmp" | head -n1)"
-fi
+code="$(curl -sL --max-time 60 "${hdr[@]}" -o "$tmp" -w '%{http_code}' \
+        "https://api.github.com/repos/$REPO/contents/cn60-waydroid-setup.sh?ref=$BRANCH" || true)"
+gh_problem=""
+case "$code" in
+    200) if bash -n "$tmp" 2>/dev/null; then
+             latest="$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9]*\).*/\1/p' "$tmp" | head -n1)"
+         else
+             gh_problem="the downloaded script has syntax errors; not using it."
+         fi ;;
+    404) if [[ -z $GITHUB_TOKEN ]]; then
+             gh_problem="the repo $REPO is private (or does not exist). Make it public, or put a read-only token after GITHUB_TOKEN= in /etc/cn60/update.conf."
+         else
+             gh_problem="$REPO or branch $BRANCH not found, or the token cannot read this repo (it needs Contents: Read-only on $REPO)."
+         fi ;;
+    401) gh_problem="the GITHUB_TOKEN in /etc/cn60/update.conf is wrong or expired. Make a new one." ;;
+    403|429) gh_problem="GitHub refused or rate-limited the request; it will retry at the next check." ;;
+    000|"") gh_problem="no connection to github.com (check the network/DNS)." ;;
+    *)   gh_problem="GitHub answered HTTP $code." ;;
+esac
 script_new=0
 if [[ $latest =~ ^[0-9]+$ && $installed =~ ^[0-9]+$ ]] && (( latest > installed )); then
     script_new=1
     install -m 700 "$tmp" "$LIB/latest-setup.sh"
 fi
 rm -f "$tmp"
-[[ -n $latest ]] || say "Could not read the script from GitHub ($REPO). If the repo is private, set GITHUB_TOKEN in /etc/cn60/update.conf."
+[[ -n $latest ]] || say "Script update check skipped: ${gh_problem:-could not read the version.}"
 
 # 2. Pending Debian updates.
 apt-get -qq -o DPkg::Lock::Timeout=300 update >/dev/null 2>&1 || true
@@ -670,7 +684,7 @@ printf 'LATEST=%s\nINSTALLED=%s\nDEBIAN_UPDATES=%s\nREBOOT=%s\nCHECKED=%s\n' \
 if [[ -z $msg ]]; then
     rm -f /etc/cn60/status
     if [[ -n $latest ]]; then say "Everything is up to date (script v$installed)."
-    else say "No Debian updates waiting. The GitHub script check failed (see above)."; fi
+    else say "No Debian updates waiting. (Script version not checked, see above.)"; fi
     exit 0
 fi
 echo "$msg" > /etc/cn60/status
