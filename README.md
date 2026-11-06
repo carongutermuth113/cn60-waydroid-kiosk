@@ -127,6 +127,7 @@ power on
    - `auto-updates`: unattended-upgrades plus the weekly timer
    - `ssh`: sshd hardening drop-in, service enabled
    - `self-update`: enables the daily `cn60-check.timer`
+   - `network-clash`: disables `dnsmasq.service` and `lxc-net.service`, which Waydroid does not need
 10. **Android image upgrade.** `waydroid upgrade`.
 11. **Boot target.** Enables seatd, disables any desktop login manager, and sets `graphical-kiosk.target` as the default.
 12. **Summary.** Prints what changed this run, the box's IP for SSH, and next steps.
@@ -415,6 +416,12 @@ Your kernel lacks `CONFIG_ANDROID_BINDER_IPC`. Use Debian's stock kernel.
 
 **No sound**
 Check `systemctl --user -M <user>@ status pipewire-pulse`. For Bluetooth audio, check the device is connected (`bluetoothctl devices Connected`), then **restart** from the menu.
+
+**"Failed to start lxc-net.service" at boot**
+Fixed in script version 7. The system-wide `dnsmasq` daemon and LXC's
+default bridge (`lxc-net`) are not used by Waydroid (it runs its own
+`waydroid0` bridge) and fight over port 53. The script disables both. By hand:
+`sudo systemctl disable --now dnsmasq lxc-net && sudo systemctl restart waydroid-container`.
 
 **Black screen / kiosk keeps restarting**
 Check `journalctl -u waydroid-kiosk -b` and `sudo waydroid log`. After 3

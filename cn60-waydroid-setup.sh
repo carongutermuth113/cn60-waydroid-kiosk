@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=6               # bump when the script changes
+SCRIPT_VERSION=7               # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -210,7 +210,7 @@ do_uninstall() {
 # ------------------------------------------------------------------ install
 install_packages() {
     log "Checking packages (installs only what is missing)"
-    local want=(waydroid lxc dnsmasq nftables cage seatd bluez cec-utils whiptail
+    local want=(waydroid lxc dnsmasq-base nftables cage seatd bluez cec-utils whiptail
                 python3-venv python3-pip git curl ca-certificates
                 build-essential dkms "linux-headers-$(uname -r)" linux-headers-amd64
                 zram-tools unattended-upgrades openssh-server)
@@ -383,6 +383,28 @@ EOF
         warn "GRUB not found; skipping boot tweaks."
     fi
     systemctl daemon-reload
+    return 0
+}
+
+# ---- Network clash fix (one-time step)
+# Waydroid runs its own bridge (waydroid0) with its own dnsmasq. The system-wide dnsmasq
+# daemon and LXC's default bridge (lxc-net, lxcbr0) are not needed. They fight over
+# port 53, so lxc-net fails at boot ("Failed to start lxc-net.service").
+fix_network_clash() {
+    log "Disabling dnsmasq.service and lxc-net.service (Waydroid does not use them)"
+    local u
+    for u in dnsmasq.service lxc-net.service; do
+        unit_exists "$u" || continue
+        case "$(unit_state "$u")" in
+            enabled|enabled-runtime)
+                systemctl disable --now "$u" >/dev/null 2>&1 && record "$DISABLED" "$u" ;;
+            *)  systemctl stop "$u" >/dev/null 2>&1 || true ;;
+        esac
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+    done
+    # Remove a leftover lxcbr0 bridge so it cannot hold the address range.
+    ip link show lxcbr0 >/dev/null 2>&1 && ip link delete lxcbr0 2>/dev/null || true
+    systemctl restart waydroid-container.service || warn "waydroid-container did not restart."
     return 0
 }
 
@@ -938,6 +960,7 @@ do_install() {
     run_step auto-updates    1 setup_auto_updates
     run_step ssh             1 setup_ssh
     run_step self-update     1 setup_self_update
+    run_step network-clash   1 fix_network_clash
 
     if [[ $UPGRADE -eq 1 ]]; then
         log "Upgrading the Waydroid Android image"
