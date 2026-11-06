@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # CN60 Waydroid kiosk for Debian 13 x86_64: boots straight into Waydroid
 # fullscreen (cage, no desktop environment), tunes the OS for kiosk use,
-# keeps Debian + Android updated, and enables SSH. Settings menu on Ctrl+Alt+F2.
+# keeps Debian + Android updated, enables SSH, updates itself from GitHub, and
+# shows update notifications inside Android. Settings menu on Ctrl+Alt+F2.
 #
 #   sudo ./cn60-waydroid-setup.sh                    install; if already installed, add only what is new
 #   sudo ./cn60-waydroid-setup.sh --no-upgrade       same, but skip the Debian/Android upgrade
@@ -14,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=4               # bump when the script changes
+SCRIPT_VERSION=5               # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -33,6 +34,7 @@ log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 MODE=install
 ASSUME_YES=0
 FORCE=0
@@ -43,7 +45,7 @@ for arg in "$@"; do
         --yes)        ASSUME_YES=1 ;;
         --force)      FORCE=1 ;;
         --no-upgrade) UPGRADE=0 ;;
-        -h|--help)    sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help)    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
         *)            die "Unknown option: $arg" ;;
     esac
 done
@@ -88,7 +90,9 @@ put_file() {
         rm -f "$tmp"; chmod "$mode" "$path"; return 0
     fi
     [[ ${3:-} == backup ]] && backup_once "$path"
-    install -D -m "$mode" "$tmp" "$path"
+    # Write next to the target, then rename: scripts that are running keep reading the old copy.
+    install -D -m "$mode" "$tmp" "$path.cn60new"
+    mv -f "$path.cn60new" "$path"
     rm -f "$tmp"
     CHANGES+=("wrote $path")
 }
@@ -140,7 +144,7 @@ do_uninstall() {
     fi
 
     log "Stopping the kiosk and returning to a normal boot"
-    systemctl disable --now waydroid-kiosk.service cn60-update.timer 2>/dev/null || true
+    systemctl disable --now waydroid-kiosk.service cn60-update.timer cn60-check.timer 2>/dev/null || true
     systemctl set-default multi-user.target
     runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
     systemctl disable --now waydroid-container.service 2>/dev/null || true
@@ -150,9 +154,13 @@ do_uninstall() {
           /etc/systemd/system/cn60-fallback.service \
           /etc/systemd/system/graphical-kiosk.target \
           /etc/systemd/system/cn60-update.service \
-          /etc/systemd/system/cn60-update.timer
+          /etc/systemd/system/cn60-update.timer \
+          /etc/systemd/system/cn60-check.service \
+          /etc/systemd/system/cn60-check.timer
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
-          /usr/local/bin/cn60-settings /usr/local/bin/cn60-update
+          /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
+          /usr/local/bin/cn60-check /etc/update-motd.d/90-cn60
+    rm -rf /usr/local/lib/cn60 /var/lib/cn60
 
     log "Reverting OS tweaks"
     rm -f /etc/sysctl.d/90-cn60.conf \
@@ -268,6 +276,23 @@ write_config() {
         CHANGES+=("created $STATE/display.conf (1920x1080)")
     fi
     chmod 644 "$STATE/display.conf"
+    # update.conf is also written only when missing (it may hold a GitHub token, so root-only).
+    if [[ ! -f $STATE/update.conf ]]; then
+        cat > "$STATE/update.conf" <<'EOF'
+# CN60 self-update settings (read by cn60-check and cn60-update)
+# GitHub repo and branch that hold cn60-waydroid-setup.sh
+REPO=carongutermuth113/cn60-waydroid-kiosk
+BRANCH=main
+# Read-only token, needed only while the repo is private (fine-grained, Contents: Read-only)
+GITHUB_TOKEN=
+# yes = the weekly update installs new script versions automatically; no = only notify
+AUTO_APPLY_SCRIPT=yes
+# yes = show update notifications inside Android
+NOTIFY=yes
+EOF
+        CHANGES+=("created $STATE/update.conf")
+    fi
+    chmod 600 "$STATE/update.conf"
 }
 
 upgrade_debian() {
@@ -359,6 +384,13 @@ EOF
     fi
     systemctl daemon-reload
     return 0
+}
+
+# ---- Self-update checks + Android notifications (one-time step)
+setup_self_update() {
+    log "Turning on daily update checks (new script version on GitHub, Debian updates)"
+    systemctl daemon-reload
+    systemctl enable --now cn60-check.timer || { warn "Could not enable cn60-check.timer."; return 1; }
 }
 
 # ---- SSH remote access (one-time step)
@@ -549,13 +581,16 @@ menu_tv_power() {
 }
 
 while true; do
-    choice=$(whiptail --title "CN60 Settings" --menu "Select" 18 60 8 \
+    status_line=$(cat /etc/cn60/status 2>/dev/null)
+    choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
+        --menu "${status_line:-Everything is up to date.}" 20 70 9 \
         resolution "Change display resolution" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
         restart    "Restart the Android kiosk" \
-        update     "Update Debian + Android now" \
+        check      "Check for updates" \
+        update     "Update script + Debian + Android now" \
         reboot     "Reboot the box" \
         exit       "Quit" 3>&1 1>&2 2>&3) || break
     case "$choice" in
@@ -564,6 +599,7 @@ while true; do
         tv)         menu_tv_power ;;
         info)       menu_info ;;
         restart)    systemctl restart waydroid-kiosk.service ;;
+        check)      clear; /usr/local/bin/cn60-check --no-notify; read -rp "Press Enter to return to the menu " _ ;;
         update)     clear; /usr/local/bin/cn60-update; read -rp "Press Enter to return to the menu " _ ;;
         reboot)     whiptail --yesno "Reboot now?" 7 40 && systemctl reboot ;;
         exit)       break ;;
@@ -571,23 +607,143 @@ while true; do
 done
 CN60_SETTINGS_EOF
 
+    # Keep a copy of this script on the box, for self-update and uninstall from anywhere.
+    put_file /usr/local/lib/cn60/cn60-waydroid-setup.sh 755 < "$SELF"
+
+    # Update checker: new script version on GitHub + pending Debian updates -> Android notification.
+    put_file /usr/local/bin/cn60-check 755 <<'CN60_CHECK_EOF'
+#!/usr/bin/env bash
+# CN60 update check: new setup-script version on GitHub, pending Debian updates,
+# pending reboot. Writes /etc/cn60/status and posts an Android notification.
+#   sudo cn60-check               check, print the result, notify in Android
+#   sudo cn60-check --quiet       no output (used by the daily timer)
+#   sudo cn60-check --no-notify   do not post an Android notification
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-check"; exit 1; }
+QUIET=0; WANT_NOTIFY=1
+for a in "$@"; do
+    case "$a" in --quiet) QUIET=1 ;; --no-notify) WANT_NOTIFY=0 ;; esac
+done
+say() { [[ $QUIET -eq 1 ]] || echo "$*"; }
+
+REPO=carongutermuth113/cn60-waydroid-kiosk; BRANCH=main; GITHUB_TOKEN=""; NOTIFY=yes
+# shellcheck disable=SC1091
+[[ -r /etc/cn60/update.conf ]] && . /etc/cn60/update.conf
+LIB=/var/lib/cn60
+mkdir -p "$LIB"
+installed="$(cat /etc/cn60/version 2>/dev/null || echo 0)"
+
+# 1. Newest setup script on GitHub (API works for public repos, and private ones with a token).
+latest=""
+tmp="$(mktemp)"
+hdr=(-H "Accept: application/vnd.github.raw")
+[[ -n $GITHUB_TOKEN ]] && hdr+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+if curl -fsSL --max-time 60 "${hdr[@]}" \
+        "https://api.github.com/repos/$REPO/contents/cn60-waydroid-setup.sh?ref=$BRANCH" -o "$tmp" \
+   && bash -n "$tmp" 2>/dev/null; then
+    latest="$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9]*\).*/\1/p' "$tmp" | head -n1)"
+fi
+script_new=0
+if [[ $latest =~ ^[0-9]+$ && $installed =~ ^[0-9]+$ ]] && (( latest > installed )); then
+    script_new=1
+    install -m 700 "$tmp" "$LIB/latest-setup.sh"
+fi
+rm -f "$tmp"
+[[ -n $latest ]] || say "Could not read the script from GitHub ($REPO). If the repo is private, set GITHUB_TOKEN in /etc/cn60/update.conf."
+
+# 2. Pending Debian updates.
+apt-get -qq -o DPkg::Lock::Timeout=300 update >/dev/null 2>&1 || true
+debs="$(apt list --upgradable 2>/dev/null | grep -c 'upgradable from' || true)"
+
+# 3. New kernel waiting for a reboot.
+newest="$(ls -1 /lib/modules | sort -V | tail -n1)"
+reboot_needed=0
+[[ -n $newest && $newest != "$(uname -r)" ]] && reboot_needed=1
+
+msg=""
+(( script_new )) && msg+="CN60 script v$latest is available (installed: v$installed). "
+(( debs > 0 )) && msg+="$debs Debian update(s) waiting. "
+(( reboot_needed )) && msg+="Reboot needed for the new kernel. "
+printf 'LATEST=%s\nINSTALLED=%s\nDEBIAN_UPDATES=%s\nREBOOT=%s\nCHECKED=%s\n' \
+    "${latest:-unknown}" "$installed" "$debs" "$reboot_needed" "$(date '+%F %R')" > "$LIB/check.env"
+
+if [[ -z $msg ]]; then
+    rm -f /etc/cn60/status
+    if [[ -n $latest ]]; then say "Everything is up to date (script v$installed)."
+    else say "No Debian updates waiting. The GitHub script check failed (see above)."; fi
+    exit 0
+fi
+echo "$msg" > /etc/cn60/status
+say "$msg"
+say "Install now: sudo cn60-update (or Settings > update). The weekly update runs Sundays at 04:30."
+
+# 4. Android notification (best effort; needs the Waydroid container running).
+android_notify() {
+    local title=$1 text=$2
+    waydroid status 2>/dev/null | grep -q 'Container:.*RUNNING' || return 1
+    waydroid shell -- /system/bin/cmd notification post -S bigtext -t "$title" cn60-update "$text" \
+        >/dev/null 2>&1 && return 0
+    printf "cmd notification post -S bigtext -t '%s' cn60-update '%s'\nexit\n" "$title" "$text" \
+        | waydroid shell >/dev/null 2>&1
+}
+if [[ $WANT_NOTIFY -eq 1 && $NOTIFY == yes ]]; then
+    if android_notify "CN60 updates available" \
+        "${msg}They install automatically on Sunday at 04:30, or open Settings > update on Ctrl+Alt+F2."; then
+        say "Android notification sent."
+    else
+        say "Could not post the Android notification (is Android running?)."
+    fi
+fi
+exit 0
+CN60_CHECK_EOF
+
+    # Shown when you log in over SSH or on a console.
+    put_file /etc/update-motd.d/90-cn60 755 <<'EOF'
+#!/bin/sh
+[ -s /etc/cn60/status ] && printf '\nCN60: %s\nRun: sudo cn60-update\n\n' "$(cat /etc/cn60/status)"
+exit 0
+EOF
+
     # Updater: used by the weekly timer, the settings menu, and this script.
     put_file /usr/local/bin/cn60-update 755 <<'CN60_UPDATE_EOF'
 #!/usr/bin/env bash
 # CN60 updater: upgrades Debian packages and the Waydroid Android image.
-#   sudo cn60-update               upgrade now, restart the kiosk if it was running
-#   sudo cn60-update --no-restart  leave the kiosk stopped (used by the setup script)
-#   sudo cn60-update --auto        weekly timer: also reboots if a new kernel was installed
+#   sudo cn60-update                   update the CN60 script from GitHub, upgrade Debian and
+#                                      Android, restart the kiosk if it was running
+#   sudo cn60-update --no-restart      leave the kiosk stopped (used by the setup script)
+#   sudo cn60-update --no-self-update  skip the GitHub script update
+#   sudo cn60-update --auto            weekly timer: follows AUTO_APPLY_SCRIPT and reboots
+#                                      if a new kernel was installed
 set -uo pipefail
 [[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-update"; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 APT=(apt-get -y -o DPkg::Lock::Timeout=600
      -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-RESTART=1; AUTO=0
+RESTART=1; AUTO=0; SELF_UPDATE=1
 for a in "$@"; do
-    case "$a" in --no-restart) RESTART=0 ;; --auto) AUTO=1 ;; esac
+    case "$a" in
+        --no-restart) RESTART=0 ;; --auto) AUTO=1 ;; --no-self-update) SELF_UPDATE=0 ;;
+    esac
 done
+AUTO_APPLY_SCRIPT=yes
+# shellcheck disable=SC1091
+[[ -r /etc/cn60/update.conf ]] && . /etc/cn60/update.conf
 rc=0
+
+if [[ $SELF_UPDATE -eq 1 ]]; then
+    echo "==> Checking GitHub for a new CN60 setup script"
+    /usr/local/bin/cn60-check --no-notify | grep -i 'script\|github' || true
+    new="$(sed -n 's/^SCRIPT_VERSION=\([0-9][0-9]*\).*/\1/p' /var/lib/cn60/latest-setup.sh 2>/dev/null | head -n1)"
+    cur="$(cat /etc/cn60/version 2>/dev/null || echo 0)"
+    if [[ $new =~ ^[0-9]+$ && $cur =~ ^[0-9]+$ ]] && (( new > cur )); then
+        if [[ $AUTO -eq 0 || $AUTO_APPLY_SCRIPT == yes ]]; then
+            echo "==> Installing CN60 setup script v$new (was v$cur)"
+            bash /var/lib/cn60/latest-setup.sh --no-upgrade || { echo "Script update failed."; rc=1; }
+        else
+            echo "Script v$new is available; AUTO_APPLY_SCRIPT=no, so it was not installed."
+        fi
+    fi
+fi
 
 echo "==> Upgrading Debian packages"
 "${APT[@]}" update || rc=1
@@ -613,6 +769,7 @@ fi
 if [[ $was_active -eq 1 && $RESTART -eq 1 ]]; then
     systemctl start waydroid-kiosk.service
 fi
+/usr/local/bin/cn60-check --quiet || true   # refresh status; notify if something is still pending
 [[ $rc -eq 0 ]] && echo "Update finished." || echo "Update finished with errors (see above)."
 exit $rc
 CN60_UPDATE_EOF
@@ -712,6 +869,31 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
+    put_file /etc/systemd/system/cn60-check.service 644 <<'EOF'
+[Unit]
+Description=CN60 update check (GitHub script version + Debian updates)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cn60-check --quiet
+EOF
+
+    put_file /etc/systemd/system/cn60-check.timer 644 <<'EOF'
+[Unit]
+Description=Check for CN60 updates daily and 15 minutes after boot
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
     systemctl daemon-reload
 }
 
@@ -741,10 +923,11 @@ do_install() {
     run_step os-tuning       1 tune_os
     run_step auto-updates    1 setup_auto_updates
     run_step ssh             1 setup_ssh
+    run_step self-update     1 setup_self_update
 
     if [[ $UPGRADE -eq 1 ]]; then
         log "Upgrading the Waydroid Android image"
-        /usr/local/bin/cn60-update --no-restart >/dev/null 2>&1 \
+        /usr/local/bin/cn60-update --no-restart --no-self-update >/dev/null 2>&1 \
             && echo "  done" || warn "Android image upgrade failed; run 'sudo cn60-update' to see why."
     fi
 
@@ -756,6 +939,7 @@ do_install() {
 
     touch "$MARK"
     echo "$SCRIPT_VERSION" > "$STATE/version"
+    /usr/local/bin/cn60-check --quiet --no-notify || true   # refresh the update status
 
     if [[ $kiosk_was_active -eq 1 ]]; then
         log "Restarting the kiosk to apply changes"
@@ -783,6 +967,8 @@ Next steps:
   - Watch the logs:           journalctl -u waydroid-kiosk -b -f
   - Settings menu:            Ctrl+Alt+F2, log in, run: sudo cn60-settings
   - Update now:               sudo cn60-update
+  - Check for updates:        sudo cn60-check
+  - Self-update settings:     sudo nano /etc/cn60/update.conf
   - Weekly auto-update:       systemctl list-timers cn60-update.timer
   - Reboot to start the kiosk (and apply boot tweaks).
   - Revert to a normal boot:  sudo systemctl set-default multi-user.target

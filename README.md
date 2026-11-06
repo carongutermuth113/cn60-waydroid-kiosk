@@ -26,6 +26,8 @@ install. Run it again later to add only what is new.
 | **Bluetooth** | Pair keyboards, mice, gamepads, remotes, headphones and speakers from a menu |
 | **SSH** | OpenSSH server enabled. Root login over SSH is disabled |
 | **Updates** | Daily security updates, plus a weekly full Debian + Android image upgrade |
+| **Self-update** | Checks this GitHub repo daily and installs new script versions in the weekly update |
+| **Notifications** | Android notification when a new script version, Debian updates or a reboot is waiting |
 | **OS tuning** | zram swap, journal size cap, no suspend, quiet fast boot, unneeded services off |
 | **Settings menu** | `sudo cn60-settings`: text menu on Ctrl+Alt+F2 |
 | **Safe re-runs** | Re-running applies only new or changed parts and keeps your settings |
@@ -125,6 +127,7 @@ power on
    - `os-tuning`: see [OS tuning](#os-tuning)
    - `auto-updates`: unattended-upgrades plus the weekly timer
    - `ssh`: sshd hardening drop-in, service enabled
+   - `self-update`: enables the daily `cn60-check.timer`
 10. **Android image upgrade.** `waydroid upgrade`.
 11. **Boot target.** Enables seatd, disables any desktop login manager, and sets `graphical-kiosk.target` as the default.
 12. **Summary.** Prints what changed this run, the box's IP for SSH, and next steps.
@@ -159,7 +162,8 @@ sudo cn60-settings
 | `tv` | TV on / standby over HDMI-CEC |
 | `info` | IP address and SSH status |
 | `restart` | Restart Android |
-| `update` | Run a full Debian + Android update now |
+| `check` | Check for a new script version and Debian updates |
+| `update` | Update the script from GitHub, then Debian + Android |
 | `reboot` | Reboot the box |
 
 ---
@@ -220,13 +224,88 @@ The installer prints the IP at the end, and the settings menu shows it under
 | Same, by hand | Any time | `sudo cn60-update`, or **update** in the settings menu |
 | Same, from the installer | Each run | Skip with `--no-upgrade` |
 
-The weekly update stops Android, upgrades everything, and starts Android
-again. It reboots **only** if a new kernel was installed.
+The weekly update first installs a newer setup script from GitHub (see
+[Self-update](#self-update-from-github)). Then it stops Android, upgrades
+everything, and starts Android again. It reboots **only** if a new kernel was
+installed.
 
 ```bash
 systemctl list-timers cn60-update.timer          # next run
 sudo systemctl disable --now cn60-update.timer   # turn weekly updates off
 journalctl -u cn60-update -b                     # last update log
+```
+
+---
+
+## Self-update from GitHub
+
+The box keeps a copy of the script at `/usr/local/lib/cn60/cn60-waydroid-setup.sh`
+and checks this repo for a newer one.
+
+```text
+cn60-check.timer   (15 min after boot + daily)
+  └─ cn60-check
+      ├─ download cn60-waydroid-setup.sh from GitHub (API), syntax-check it
+      ├─ compare its SCRIPT_VERSION with /etc/cn60/version
+      ├─ count pending Debian updates, check for a new kernel
+      ├─ write /etc/cn60/status            (shown in the menu and at SSH login)
+      └─ post an Android notification if anything is waiting
+
+cn60-update  (weekly timer, menu "update", or sudo cn60-update)
+  ├─ newer script found? → run it with --no-upgrade (adds only what is new)
+  ├─ apt full-upgrade
+  ├─ waydroid upgrade
+  └─ cn60-check again (clears the status when everything is done)
+```
+
+Settings live in `/etc/cn60/update.conf` (root-only, created on first install,
+never overwritten):
+
+```bash
+REPO=carongutermuth113/cn60-waydroid-kiosk
+BRANCH=main
+GITHUB_TOKEN=          # needed only while the repo is private
+AUTO_APPLY_SCRIPT=yes  # no = weekly update only notifies, you install by hand
+NOTIFY=yes             # no = no Android notifications
+```
+
+**Private repo:** the box needs a read-only token to download the script.
+On GitHub: Settings → Developer settings → Fine-grained tokens → Generate:
+*Only select repositories* → this repo, *Contents: Read-only*, nothing else.
+Then on the box, enter it yourself:
+
+```bash
+sudo nano /etc/cn60/update.conf     # paste it after GITHUB_TOKEN=
+sudo cn60-check                     # should say "Everything is up to date" or "v… is available"
+```
+
+If you make the repo public, leave `GITHUB_TOKEN` empty.
+
+> **Releasing a new version:** bump `SCRIPT_VERSION=` near the top of the
+> script in every commit you want boxes to pick up. Boxes only install a
+> version **higher** than the one they have. They never downgrade.
+>
+> **Trust:** the box runs whatever script is on `main` as root. Anyone who can
+> push to this repo can run code on your boxes. Protect the account with 2FA.
+
+### Notifications in Android
+
+`cn60-check` posts a notification through Android's own
+`cmd notification post` (run with `waydroid shell`), for example:
+
+> **CN60 updates available**
+> CN60 script v6 is available (installed: v5). 12 Debian update(s) waiting.
+> They install automatically on Sunday at 04:30, or open Settings > update on Ctrl+Alt+F2.
+
+Each new notification replaces the previous one instead of stacking up. It
+appears at most once a day (and 15 minutes after boot) while something is
+waiting. The same message shows at the top of `cn60-settings` and when you log
+in over SSH.
+
+```bash
+sudo cn60-check                         # check now, print, notify
+systemctl list-timers cn60-check.timer  # next check
+journalctl -u cn60-check -b             # check log
 ```
 
 ---
@@ -262,12 +341,19 @@ edit. Units the script masks, disables or enables are recorded under
 | `/etc/cn60/version`, `installed`, `steps/` | Install state for safe re-runs |
 | `/etc/cn60/packages-added`, `groups-added`, `masked`, `disabled`, `enabled`, `backup/` | What uninstall will revert |
 | `/usr/local/bin/cn60-settings` | Settings menu |
-| `/usr/local/bin/cn60-update` | Updater |
+| `/usr/local/bin/cn60-update` | Updater (script from GitHub, Debian, Android) |
+| `/usr/local/bin/cn60-check` | Update checker + Android notification |
+| `/usr/local/lib/cn60/cn60-waydroid-setup.sh` | Installed copy of this script |
+| `/etc/cn60/update.conf` | Self-update settings (repo, token, auto-apply, notify) |
+| `/etc/cn60/status` | Current "updates waiting" message |
+| `/var/lib/cn60/` | Downloaded newer script, last check result |
+| `/etc/update-motd.d/90-cn60` | Shows the status at SSH/console login |
 | `/usr/local/bin/cn60-kiosk-start`, `cn60-kiosk-user` | Kiosk launchers |
 | `/etc/systemd/system/waydroid-kiosk.service` | The kiosk |
 | `/etc/systemd/system/cn60-fallback.service` | Text login if the kiosk fails |
 | `/etc/systemd/system/graphical-kiosk.target` | Default boot target |
 | `/etc/systemd/system/cn60-update.{service,timer}` | Weekly update |
+| `/etc/systemd/system/cn60-check.{service,timer}` | Daily update check |
 
 ---
 
@@ -309,6 +395,13 @@ The file lost its executable bit while being copied. Run `chmod +x cn60-waydroid
 **`$'\r': command not found` or `bash\r: No such file or directory`**
 The file has Windows line endings. Fix them with `sed -i 's/\r$//' cn60-waydroid-setup.sh`.
 
+**No Android notification**
+Run `sudo cn60-check`. It says if GitHub could not be reached (private repo
+without a token) or if posting to Android failed. Notifications need the
+Waydroid container running. Older Waydroid images without
+`cmd notification` cannot show them; the status still appears in the menu and
+at SSH login.
+
 **SSH: "System is booting up. Unprivileged users are not permitted to log in yet"**
 Fixed in script version 4. Older versions booted without
 `systemd-user-sessions`, which left `/run/nologin` in place. To recover:
@@ -334,6 +427,8 @@ failures you get a text login on tty1 automatically.
 
 ```bash
 sudo ./cn60-waydroid-setup.sh --uninstall
+# or, from anywhere:
+sudo /usr/local/lib/cn60/cn60-waydroid-setup.sh --uninstall
 sudo reboot
 ```
 
