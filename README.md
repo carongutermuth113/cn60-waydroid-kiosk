@@ -254,6 +254,23 @@ the ARM translation, but not all of them.
 
 ---
 
+### Apps Aurora calls "not supported"
+
+Aurora uses Google Play's compatibility check. Waydroid reports itself as a
+tablet, so apps made only for Android TV (they require `android.software.leanback`)
+show as "not supported". This has nothing to do with ARM: ARM apps install
+normally once libhoudini is active. Android itself does not enforce that check, so
+install the APK directly:
+
+```bash
+sudo -S -p '' cn60-apps at4k                                  # AT4K Launcher, newest GitHub release (also updates it)
+sudo -S -p '' cn60-apps install /home/tv/Downloads/app.apk    # any single .apk file
+sudo -S -p '' cn60-apps install https://example.com/app.apk   # or a direct https link
+```
+
+Split bundles (.apks, .xapk, .apkm) are not supported. Take apps only from the
+developer or another source you trust.
+
 ## Remote screen (see and control Android from a PC)
 
 Use [scrcpy](https://github.com/Genymobile/scrcpy) to mirror the CN60's
@@ -434,7 +451,7 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-update` | Updater (script from GitHub, Debian, Android) |
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
 | `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
-| `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store) |
+| `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store, AT4K, any .apk) |
 | `/usr/local/bin/cn60-crashlog` | Crash report, saved to `/var/log/cn60-crash-report.txt` |
 | `/cn60.swap`, `/etc/cn60/swapfile` | Swap file and its record for uninstall |
 | `/etc/cn60/options` | Answers to install questions (`AURORA_STORE=yes/no`) |

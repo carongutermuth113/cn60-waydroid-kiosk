@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=13              # bump when the script changes
+SCRIPT_VERSION=14              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -989,9 +989,11 @@ CN60_REMOTE_EOF
     put_file /usr/local/bin/cn60-apps 755 <<'CN60_APPS_EOF'
 #!/usr/bin/env bash
 # CN60 Android app installer.
-#   sudo cn60-apps aurora    install Aurora Store (Google Play client) from F-Droid
-#   sudo cn60-apps pending   install apps that were queued while Android was not running
-#   sudo cn60-apps list      list installed Android apps
+#   sudo cn60-apps aurora           install Aurora Store (Google Play client) from F-Droid
+#   sudo cn60-apps at4k             install/update AT4K Launcher (Android TV launcher) from its GitHub releases
+#   sudo cn60-apps install <apk>    install an .apk file or https:// link (apps Aurora calls "not supported")
+#   sudo cn60-apps pending          install apps that were queued while Android was not running
+#   sudo cn60-apps list             list installed Android apps
 set -uo pipefail
 [[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-apps $*"; exit 1; }
 PENDING=/etc/cn60/pending-apps
@@ -1027,22 +1029,77 @@ install_fdroid() {
        || [[ "$(head -c2 "$tmp")" != PK ]]; then
         rm -f "$tmp"; echo "Download of $name failed."; return 1
     fi
-    chmod 644 "$tmp"
-    echo "Installing $name in Android..."
-    if ! as_user waydroid app install "$tmp"; then
-        rm -f "$tmp"; echo "Install of $name failed."; return 1
-    fi
+    local rc=0
+    put_apk "$tmp" "$name" "$pkg" || rc=1
     rm -f "$tmp"
+    [[ $rc -eq 0 ]] && unqueue "$key"
+    return $rc
+}
+
+# put_apk <apk file> <display name> [package id]: install (or update) an APK in Android.
+# Android does not check Play Store "compatibility" (TV-only, tablet-only), only the APK itself.
+put_apk() {
+    local apk=$1 name=$2 pkg=${3:-} tmp rc=0
+    if [[ "$(head -c2 "$apk" 2>/dev/null)" != PK ]]; then
+        echo "$apk is not an APK file."; return 1
+    fi
+    # Copy to a file the kiosk user can read; the original may sit in a private folder.
+    tmp="$(mktemp --suffix=.apk)"
+    cp "$apk" "$tmp" && chmod 644 "$tmp"
+    echo "Installing $name in Android..."
+    as_user waydroid app install "$tmp" || rc=1
+    rm -f "$tmp"
+    if [[ $rc -ne 0 ]]; then
+        echo "Install of $name failed. Split APKs (.apks, .xapk, .apkm bundles) are not supported; use a single .apk."
+        return 1
+    fi
     sleep 3
-    if has_pkg "$pkg"; then
-        unqueue "$key"; echo "$name installed. Open it from the Android app drawer."
+    if [[ -z $pkg ]] || has_pkg "$pkg"; then
+        echo "$name installed. Open it from the Android app drawer."
     else
         echo "$name was sent to Android but does not show up yet; check the TV screen."
     fi
 }
 
+# install_github <queue key> <display name> <package id> <owner/repo>: newest release .apk
+install_github() {
+    local key=$1 name=$2 pkg=$3 repo=$4 url tmp
+    if ! android_up; then queue "$key" "$name"; return 0; fi
+    url="$(curl -fsSL --max-time 30 "https://api.github.com/repos/$repo/releases/latest" \
+        | python3 -c 'import json,sys; r=json.load(sys.stdin); print(next(a["browser_download_url"] for a in r["assets"] if a["name"].endswith(".apk")))' 2>/dev/null)"
+    [[ $url == https://* ]] || { echo "Could not find $name's newest release on GitHub ($repo)."; return 1; }
+    tmp="$(mktemp --suffix=.apk)"
+    echo "Downloading $name from $url ..."
+    if ! curl -fL --max-time 600 -o "$tmp" "$url"; then
+        rm -f "$tmp"; echo "Download of $name failed."; return 1
+    fi
+    local rc=0
+    put_apk "$tmp" "$name" "$pkg" || rc=1
+    rm -f "$tmp"
+    [[ $rc -eq 0 ]] && unqueue "$key"
+    return $rc
+}
+
+# install_any <file.apk | https://...>: sideload any single APK.
+install_any() {
+    local src=${1:-} tmp rc
+    [[ -n $src ]] || { echo "Usage: sudo cn60-apps install <file.apk | https://link-to.apk>"; return 1; }
+    android_up || { echo "Android is not running. Start it first (it runs on the TV screen), then try again."; return 1; }
+    if [[ $src == https://* ]]; then
+        tmp="$(mktemp --suffix=.apk)"
+        echo "Downloading $src ..."
+        curl -fL --max-time 600 -o "$tmp" "$src" || { rm -f "$tmp"; echo "Download failed."; return 1; }
+        put_apk "$tmp" "$(basename "${src%%\?*}")"; rc=$?
+        rm -f "$tmp"; return $rc
+    fi
+    [[ -f $src ]] || { echo "File not found: $src"; return 1; }
+    put_apk "$src" "$(basename "$src")"
+}
+
 case "${1:-}" in
     aurora)  install_fdroid aurora "Aurora Store" com.aurora.store ;;
+    at4k)    install_github at4k "AT4K Launcher" com.overdevs.at4k avadhesh18/at4k ;;
+    install) install_any "${2:-}" ;;
     pending)
         [[ -s $PENDING ]] || exit 0
         android_up || exit 0
@@ -1050,11 +1107,12 @@ case "${1:-}" in
         while read -r app; do
             case "$app" in
                 aurora) install_fdroid aurora "Aurora Store" com.aurora.store || rc=1 ;;
+                at4k)   install_github at4k "AT4K Launcher" com.overdevs.at4k avadhesh18/at4k || rc=1 ;;
             esac
         done < <(cat "$PENDING")
         exit $rc ;;
     list)    as_user waydroid app list ;;
-    *)       sed -n '2,5p' "$0"; exit 1 ;;
+    *)       sed -n '2,7p' "$0"; exit 1 ;;
 esac
 CN60_APPS_EOF
 
