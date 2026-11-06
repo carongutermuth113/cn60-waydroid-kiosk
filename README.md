@@ -27,6 +27,7 @@ install. Run it again later to add only what is new.
 | **SSH** | OpenSSH server enabled. Root login over SSH is disabled |
 | **Updates** | Daily security updates, plus a weekly full Debian + Android image upgrade |
 | **Self-update** | Checks this GitHub repo daily and installs new script versions in the weekly update |
+| **Remote screen** | See and control Android from a PC with scrcpy, through an SSH tunnel |
 | **Notifications** | Android notification when a new script version, Debian updates or a reboot is waiting |
 | **OS tuning** | zram swap, journal size cap, no suspend, quiet fast boot, unneeded services off |
 | **Settings menu** | `sudo cn60-settings`: text menu on Ctrl+Alt+F2 |
@@ -161,6 +162,7 @@ sudo cn60-settings
 | `bluetooth` | Scan/pair, status, reconnect, disconnect, forget devices |
 | `tv` | TV on / standby over HDMI-CEC |
 | `info` | IP address and SSH status |
+| `remote` | How to see this screen on a PC (scrcpy) |
 | `restart` | Restart Android |
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
@@ -212,6 +214,54 @@ ssh <your-user>@<box-ip>
 
 The installer prints the IP at the end, and the settings menu shows it under
 `info`. Settings live in `/etc/ssh/sshd_config.d/90-cn60.conf`.
+
+---
+
+## Remote screen (see and control Android from a PC)
+
+Use [scrcpy](https://github.com/Genymobile/scrcpy) to mirror the CN60's
+Android screen to a PC window and control it with the PC's mouse and
+keyboard. This is useful for troubleshooting, typing passwords, or installing
+apps without walking to the TV.
+
+It connects to Android's ADB through an **SSH tunnel**. ADB is never opened to
+your network, because Waydroid's ADB has full control of Android. Anyone who
+can log in over SSH can use it, nobody else.
+
+```text
+PC: scrcpy ─► adb 127.0.0.1:15555 ─► SSH tunnel ─► CN60 ─► Android ADB (192.168.240.112:5555)
+```
+
+### Windows (easiest)
+
+1. Install scrcpy once (PowerShell): `winget install --id Genymobile.scrcpy`
+   (or unzip it from the [releases page](https://github.com/Genymobile/scrcpy/releases)
+   and put the .bat file in that folder)
+2. Download [`windows/cn60-screen.bat`](windows/cn60-screen.bat) and double-click it
+3. Type `tv@192.168.1.158` (your box), then the CN60 password when asked
+4. The first time, the TV may ask **"Allow USB debugging?"**. Tick *Always allow* and press *Allow*
+
+A window with the Android screen opens. Close the window and the tunnel window when done.
+
+### By hand (Windows, Linux, macOS)
+
+```bash
+# on the CN60, check it is ready and get the exact commands:
+sudo cn60-remote
+
+# on the PC:
+ssh -N -L 15555:192.168.240.112:5555 tv@192.168.1.158   # leave open
+adb connect 127.0.0.1:15555                              # in a second terminal
+scrcpy -s 127.0.0.1:15555 --no-audio
+```
+
+Install scrcpy with `sudo apt install scrcpy` (Linux) or `brew install scrcpy` (macOS).
+
+Handy scrcpy options: `--max-size 1280` (smoother over Wi-Fi), `--turn-screen-off`
+(PC only, TV goes dark), `--record file.mp4`. Drag an `.apk` onto the window to install it.
+
+Tip: set up an SSH key (`ssh-keygen`, then `ssh-copy-id tv@192.168.1.158`, or
+copy the key by hand on Windows) so you are not asked for the password twice.
 
 ---
 
@@ -343,6 +393,7 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-settings` | Settings menu |
 | `/usr/local/bin/cn60-update` | Updater (script from GitHub, Debian, Android) |
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
+| `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
 | `/usr/local/lib/cn60/cn60-waydroid-setup.sh` | Installed copy of this script |
 | `/etc/cn60/update.conf` | Self-update settings (repo, token, auto-apply, notify) |
 | `/etc/cn60/status` | Current "updates waiting" message |
@@ -422,6 +473,11 @@ Fixed in script version 7. The system-wide `dnsmasq` daemon and LXC's
 default bridge (`lxc-net`) are not used by Waydroid (it runs its own
 `waydroid0` bridge) and fight over port 53. The script disables both. By hand:
 `sudo systemctl disable --now dnsmasq lxc-net && sudo systemctl restart waydroid-container`.
+
+**Remote screen: `adb connect` fails or scrcpy says "device unauthorized"**
+Run `sudo cn60-remote` on the box. It turns on network ADB inside Android if
+it is off. "Unauthorized" means the *Allow USB debugging?* prompt on the TV
+has not been accepted yet. Check the TV screen.
 
 **Black screen / kiosk keeps restarting**
 Check `journalctl -u waydroid-kiosk -b` and `sudo waydroid log`. After 3

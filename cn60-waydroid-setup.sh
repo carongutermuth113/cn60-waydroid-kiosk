@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=7               # bump when the script changes
+SCRIPT_VERSION=8               # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -159,7 +159,7 @@ do_uninstall() {
           /etc/systemd/system/cn60-check.timer
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
           /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
-          /usr/local/bin/cn60-check /etc/update-motd.d/90-cn60
+          /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /etc/update-motd.d/90-cn60
     rm -rf /usr/local/lib/cn60 /var/lib/cn60
 
     log "Reverting OS tweaks"
@@ -605,11 +605,12 @@ menu_tv_power() {
 while true; do
     status_line=$(cat /etc/cn60/status 2>/dev/null)
     choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
-        --menu "${status_line:-Everything is up to date.}" 20 70 9 \
+        --menu "${status_line:-Everything is up to date.}" 21 70 10 \
         resolution "Change display resolution" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
+        remote     "See this screen on a PC (scrcpy)" \
         restart    "Restart the Android kiosk" \
         check      "Check for updates" \
         update     "Update script + Debian + Android now" \
@@ -620,6 +621,7 @@ while true; do
         bluetooth)  menu_bluetooth ;;
         tv)         menu_tv_power ;;
         info)       menu_info ;;
+        remote)     clear; /usr/local/bin/cn60-remote; read -rp "Press Enter to return to the menu " _ ;;
         restart)    systemctl restart waydroid-kiosk.service ;;
         check)      clear; /usr/local/bin/cn60-check --no-notify; read -rp "Press Enter to return to the menu " _ ;;
         update)     clear; /usr/local/bin/cn60-update; read -rp "Press Enter to return to the menu " _ ;;
@@ -732,6 +734,46 @@ if [[ $WANT_NOTIFY -eq 1 && $NOTIFY == yes ]]; then
 fi
 exit 0
 CN60_CHECK_EOF
+
+    # Remote screen: lets a PC see and control Android with scrcpy through an SSH tunnel.
+    put_file /usr/local/bin/cn60-remote 755 <<'CN60_REMOTE_EOF'
+#!/usr/bin/env bash
+# CN60 remote screen helper: see and control Android from a PC with scrcpy over SSH.
+# ADB is never opened to the network; the PC reaches it only through an SSH tunnel.
+#   cn60-remote          show status and the commands to run on your PC
+#   sudo cn60-remote     same, and turn on network ADB inside Android if it is off
+#   cn60-remote --ip     print only Android's internal IP (used by the Windows helper)
+set -uo pipefail
+ip="$(waydroid status 2>/dev/null | sed -n 's/^IP address:[[:space:]]*//p' | head -n1)"
+ip="${ip:-192.168.240.112}"
+if [[ ${1:-} == --ip ]]; then echo "$ip"; exit 0; fi
+
+port_open() { timeout 3 bash -c "exec 3<>/dev/tcp/$ip/5555" 2>/dev/null; }
+if ! port_open && [[ $EUID -eq 0 ]]; then
+    echo "Turning on network ADB inside Android..."
+    waydroid shell -- /system/bin/setprop service.adb.tcp.port 5555 >/dev/null 2>&1
+    waydroid shell -- /system/bin/stop adbd >/dev/null 2>&1
+    waydroid shell -- /system/bin/start adbd >/dev/null 2>&1
+    sleep 3
+fi
+if port_open; then
+    state="ready"
+else
+    state="NOT reachable. Is Android running? Try: sudo cn60-remote"
+fi
+box_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+user="$(cat /etc/cn60/user 2>/dev/null || id -un)"
+cat <<EOF
+Android ADB ($ip:5555): $state
+
+On your PC (Windows: double-click windows\cn60-screen.bat from the GitHub repo), or by hand:
+  1. ssh -N -L 15555:$ip:5555 $user@${box_ip:-<box-ip>}     (leave it open)
+  2. adb connect 127.0.0.1:15555
+  3. scrcpy -s 127.0.0.1:15555 --no-audio
+
+The first time, the TV may ask "Allow USB debugging?": tick "Always allow" and press Allow.
+EOF
+CN60_REMOTE_EOF
 
     # Shown when you log in over SSH or on a console.
     put_file /etc/update-motd.d/90-cn60 755 <<'EOF'
@@ -1005,6 +1047,7 @@ Next steps:
   - Settings menu:            Ctrl+Alt+F2, log in, run: sudo cn60-settings
   - Update now:               sudo cn60-update
   - Check for updates:        sudo cn60-check
+  - See the screen on a PC:   sudo cn60-remote
   - Self-update settings:     sudo nano /etc/cn60/update.conf
   - Weekly auto-update:       systemctl list-timers cn60-update.timer
   - Reboot to start the kiosk (and apply boot tweaks).

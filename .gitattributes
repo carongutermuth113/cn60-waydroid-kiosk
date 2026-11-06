@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.sh text eol=lf
+# keep Windows line endings in the repo itself, so a raw download works too
+*.bat -text
