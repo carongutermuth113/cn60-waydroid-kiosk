@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+# CN60 Waydroid kiosk for Debian 13 x86_64: boots straight into Waydroid
+# fullscreen (cage, no desktop environment), tunes the OS for kiosk use,
+# keeps Debian + Android updated, and enables SSH. Settings menu on Ctrl+Alt+F2.
+#
+#   sudo ./cn60-waydroid-setup.sh                    install; if already installed, add only what is new
+#   sudo ./cn60-waydroid-setup.sh --no-upgrade       same, but skip the Debian/Android upgrade
+#   sudo ./cn60-waydroid-setup.sh --force            redo every step, even ones already done
+#   sudo ./cn60-waydroid-setup.sh --uninstall        remove everything this script added
+#   sudo ./cn60-waydroid-setup.sh --uninstall --yes  same, without the confirmation prompt
+#
+# Status: syntax-checked only (bash -n). Not run on the CN60 hardware.
+# Self-contained: writes the settings menu and updater to /usr/local/bin.
+
+set -euo pipefail
+
+SCRIPT_VERSION=4               # bump when the script changes
+STATE=/etc/cn60
+MARK=$STATE/installed          # present once a full install finished
+STEPS=$STATE/steps             # one file per one-time step, holding the step version
+BACKUP=$STATE/backup           # originals of system files this script edits
+PKGS_ADDED=$STATE/packages-added
+GROUPS_ADDED=$STATE/groups-added
+MASKED=$STATE/masked           # units this script masked
+DISABLED=$STATE/disabled       # units this script disabled
+ENABLED=$STATE/enabled         # units this script enabled (besides its own)
+USER_FILE=$STATE/user
+export DEBIAN_FRONTEND=noninteractive
+APT=(apt-get -y -o DPkg::Lock::Timeout=600
+     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+log()  { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+MODE=install
+ASSUME_YES=0
+FORCE=0
+UPGRADE=1
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall)  MODE=uninstall ;;
+        --yes)        ASSUME_YES=1 ;;
+        --force)      FORCE=1 ;;
+        --no-upgrade) UPGRADE=0 ;;
+        -h|--help)    sed -n '2,12p' "$0"; exit 0 ;;
+        *)            die "Unknown option: $arg" ;;
+    esac
+done
+
+# Re-run as root, keeping the invoking user so Waydroid can run as them.
+if [[ $EUID -ne 0 ]]; then
+    command -v sudo >/dev/null || die "Run as root (sudo)."
+    exec sudo -E bash "$0" "$@"
+fi
+
+KUSER="${SUDO_USER:-}"
+if [[ -z "$KUSER" || "$KUSER" == root ]]; then
+    [[ -r $USER_FILE ]] && KUSER="$(cat "$USER_FILE")"
+fi
+[[ -n "$KUSER" && "$KUSER" != root ]] || \
+    die "Run with sudo from your normal user account, not from a root login."
+id "$KUSER" >/dev/null 2>&1 || die "User '$KUSER' does not exist."
+
+CHANGES=()                     # what this run added or changed, printed at the end
+
+# ------------------------------------------------------------------ helpers
+# record <file> <line>: append a line once (state lists used by uninstall).
+record() {
+    mkdir -p "$STATE"
+    grep -qxF -- "$2" "$1" 2>/dev/null || echo "$2" >> "$1"
+}
+
+# backup_once <path>: keep the original of a system file before the first edit.
+backup_once() {
+    local b="$BACKUP$1"
+    [[ -e $b || -e $b.absent ]] && return 0
+    mkdir -p "$(dirname "$b")"
+    if [[ -e $1 ]]; then cp -a "$1" "$b"; else touch "$b.absent"; fi
+}
+
+# put_file <path> <mode> [backup]: write stdin to path only if the content changed.
+put_file() {
+    local path=$1 mode=$2 tmp
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    if [[ -f $path ]] && cmp -s "$tmp" "$path"; then
+        rm -f "$tmp"; chmod "$mode" "$path"; return 0
+    fi
+    [[ ${3:-} == backup ]] && backup_once "$path"
+    install -D -m "$mode" "$tmp" "$path"
+    rm -f "$tmp"
+    CHANGES+=("wrote $path")
+}
+
+# set_kv <file> <key> <value>: set KEY=value, uncommenting or appending as needed.
+set_kv() {
+    if grep -qE "^#?[[:space:]]*$2=" "$1"; then
+        sed -i -E "s|^#?[[:space:]]*$2=.*|$2=$3|" "$1"
+    else
+        echo "$2=$3" >> "$1"
+    fi
+}
+
+unit_state() { systemctl is-enabled "$1" 2>/dev/null || true; }
+unit_exists() { [[ -n "$(systemctl list-unit-files "$1" --no-legend 2>/dev/null)" ]]; }
+
+# run_step <name> <version> <function>: one-time steps; rerun only when the version changes.
+run_step() {
+    local name=$1 ver=$2 fn=$3
+    if [[ $FORCE -eq 0 && -f $STEPS/$name && "$(cat "$STEPS/$name")" == "$ver" ]]; then
+        echo "  $name: already done (v$ver)"
+        return 0
+    fi
+    if "$fn"; then
+        mkdir -p "$STEPS"; echo "$ver" > "$STEPS/$name"
+        CHANGES+=("step $name v$ver")
+    else
+        warn "$name did not finish; it will be retried next run."
+    fi
+}
+
+check_platform() {
+    [[ "$(uname -m)" == x86_64 ]] || die "Needs x86_64; this machine is $(uname -m)."
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 ]] || \
+        warn "Expected Debian 13, found ${PRETTY_NAME:-unknown}. Continuing."
+}
+
+# ---------------------------------------------------------------- uninstall
+do_uninstall() {
+    if [[ $ASSUME_YES -eq 0 ]]; then
+        [[ -t 0 ]] || die "Non-interactive uninstall needs --yes."
+        echo "This removes the kiosk, Waydroid and its data (/var/lib/waydroid, ~$KUSER/.local/share/waydroid),"
+        echo "the OS tweaks and auto-updates, the packages this script added, and group memberships it added."
+        echo "If this script installed SSH it is removed too: run this from the box, not over SSH."
+        read -rp "Type UNINSTALL to continue: " confirm
+        [[ "$confirm" == UNINSTALL ]] || die "Cancelled."
+    fi
+
+    log "Stopping the kiosk and returning to a normal boot"
+    systemctl disable --now waydroid-kiosk.service cn60-update.timer 2>/dev/null || true
+    systemctl set-default multi-user.target
+    runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
+    systemctl disable --now waydroid-container.service 2>/dev/null || true
+
+    log "Removing systemd units and helper scripts"
+    rm -f /etc/systemd/system/waydroid-kiosk.service \
+          /etc/systemd/system/cn60-fallback.service \
+          /etc/systemd/system/graphical-kiosk.target \
+          /etc/systemd/system/cn60-update.service \
+          /etc/systemd/system/cn60-update.timer
+    rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
+          /usr/local/bin/cn60-settings /usr/local/bin/cn60-update
+
+    log "Reverting OS tweaks"
+    rm -f /etc/sysctl.d/90-cn60.conf \
+          /etc/systemd/journald.conf.d/90-cn60.conf \
+          /etc/systemd/system.conf.d/90-cn60.conf \
+          /etc/apt/apt.conf.d/52cn60-unattended \
+          /etc/ssh/sshd_config.d/90-cn60.conf
+    [[ -r $MASKED ]]   && while read -r u; do [[ -n $u ]] && systemctl unmask "$u" 2>/dev/null || true; done < "$MASKED"
+    [[ -r $DISABLED ]] && while read -r u; do [[ -n $u ]] && systemctl enable "$u" 2>/dev/null || true; done < "$DISABLED"
+    [[ -r $ENABLED ]]  && while read -r u; do [[ -n $u ]] && systemctl disable "$u" 2>/dev/null || true; done < "$ENABLED"
+    if [[ -d $BACKUP ]]; then
+        while IFS= read -r b; do
+            local target=${b#"$BACKUP"}
+            if [[ $target == *.absent ]]; then rm -f "${target%.absent}"
+            else cp -a "$b" "$target"; fi
+        done < <(find "$BACKUP" -type f)
+        [[ -e $BACKUP/etc/default/grub ]] && { update-grub || warn "update-grub failed."; }
+    fi
+    systemctl daemon-reload
+
+    log "Removing Waydroid data, ARM translation and CN60 config"
+    rm -rf /var/lib/waydroid "/home/$KUSER/.local/share/waydroid" \
+           "/home/$KUSER/.share/waydroid" /opt/waydroid_script
+    rm -f /etc/modules-load.d/waydroid-binder.conf /etc/modprobe.d/waydroid-binder.conf
+    loginctl disable-linger "$KUSER" 2>/dev/null || true
+
+    log "Removing group memberships this script added"
+    if [[ -r $GROUPS_ADDED ]]; then
+        while read -r user group; do
+            [[ -n "${user:-}" ]] && gpasswd -d "$user" "$group" >/dev/null 2>&1 || true
+        done < "$GROUPS_ADDED"
+    fi
+
+    log "Purging packages this script installed (packages that were already present are kept)"
+    if [[ -r $PKGS_ADDED ]]; then
+        # shellcheck disable=SC2046
+        "${APT[@]}" purge $(cat "$PKGS_ADDED") || warn "Some packages failed to purge."
+        "${APT[@]}" autoremove || true
+    fi
+
+    rm -rf "$STATE"
+    echo
+    echo "Uninstall complete. Reboot now: sudo reboot"
+    exit 0
+}
+
+# ------------------------------------------------------------------ install
+install_packages() {
+    log "Checking packages (installs only what is missing)"
+    local want=(waydroid lxc dnsmasq nftables cage seatd bluez cec-utils whiptail
+                python3-venv python3-pip git curl ca-certificates
+                build-essential dkms "linux-headers-$(uname -r)" linux-headers-amd64
+                zram-tools unattended-upgrades openssh-server)
+    # Sound for Android (HDMI and Bluetooth headphones/speakers) goes through the host's audio server.
+    if dpkg -s pulseaudio >/dev/null 2>&1; then
+        want+=(pulseaudio-module-bluetooth)
+    else
+        want+=(pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth)
+    fi
+    local missing=()
+    for p in "${want[@]}"; do
+        if ! dpkg -s "$p" >/dev/null 2>&1; then missing+=("$p"); fi
+    done
+    "${APT[@]}" update
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        "${APT[@]}" install "${missing[@]}"
+        for p in "${missing[@]}"; do record "$PKGS_ADDED" "$p"; done
+        CHANGES+=("installed ${missing[*]}")
+    else
+        echo "  all packages present"
+    fi
+}
+
+ensure_user_groups() {
+    log "Checking $KUSER's device groups"
+    local seat_group=seat
+    getent group _seatd >/dev/null && seat_group=_seatd
+    for g in video render input "$seat_group"; do
+        getent group "$g" >/dev/null || continue
+        if ! id -nG "$KUSER" | tr ' ' '\n' | grep -qx "$g"; then
+            usermod -aG "$g" "$KUSER"
+            record "$GROUPS_ADDED" "$KUSER $g"
+            CHANGES+=("added $KUSER to $g")
+        fi
+    done
+    # Keeps /run/user/<uid> alive so Waydroid's session bus exists at boot.
+    loginctl enable-linger "$KUSER"
+}
+
+ensure_binder() {
+    log "Checking binder kernel support"
+    if ! lsmod | grep -q '^binder_linux'; then
+        modprobe binder_linux devices="binder,hwbinder,vndbinder" 2>/dev/null || true
+    fi
+    if [[ ! -e /dev/binder && ! -e /dev/binderfs/binder-control ]]; then
+        mkdir -p /dev/binderfs
+        mount -t binder binder /dev/binderfs 2>/dev/null || true
+    fi
+    if [[ ! -e /dev/binder && ! -e /dev/binderfs/binder-control ]]; then
+        die "No binder support in this kernel (CONFIG_ANDROID_BINDER_IPC missing). Waydroid cannot run on this box."
+    fi
+    put_file /etc/modules-load.d/waydroid-binder.conf 644 <<< "binder_linux"
+    put_file /etc/modprobe.d/waydroid-binder.conf 644 \
+        <<< 'options binder_linux devices="binder,hwbinder,vndbinder"'
+}
+
+write_config() {
+    # display.conf is written only when missing, so re-running never overwrites a user's choice.
+    mkdir -p "$STATE"
+    echo "$KUSER" > "$USER_FILE"
+    if [[ ! -f $STATE/display.conf ]]; then
+        printf 'WIDTH=1920\nHEIGHT=1080\n' > "$STATE/display.conf"
+        CHANGES+=("created $STATE/display.conf (1920x1080)")
+    fi
+    chmod 644 "$STATE/display.conf"
+}
+
+upgrade_debian() {
+    log "Upgrading Debian packages"
+    "${APT[@]}" full-upgrade || { warn "Debian upgrade failed; continuing."; return 0; }
+    "${APT[@]}" autoremove --purge || true
+    "${APT[@]}" autoclean || true
+}
+
+# ---- OS tuning (one-time step; bump its version in do_install when it changes)
+tune_os() {
+    log "Tuning the OS for kiosk use"
+
+    # Memory: compressed RAM swap, keep apps in RAM longer.
+    put_file /etc/sysctl.d/90-cn60.conf 644 <<'EOF'
+# CN60 kiosk tuning (removed by cn60-waydroid-setup.sh --uninstall)
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+EOF
+    sysctl --system >/dev/null 2>&1 || warn "sysctl reload failed; applies after reboot."
+
+    if [[ -f /etc/default/zramswap ]]; then
+        backup_once /etc/default/zramswap
+        set_kv /etc/default/zramswap ALGO zstd
+        set_kv /etc/default/zramswap PERCENT 50
+        set_kv /etc/default/zramswap PRIORITY 100
+        systemctl enable zramswap.service >/dev/null 2>&1 || true
+        systemctl restart zramswap.service || warn "zram swap did not start; continuing."
+    else
+        warn "zram-tools config missing; skipping zram swap."
+    fi
+
+    # Logs: cap the journal so the disk does not fill up over months.
+    put_file /etc/systemd/journald.conf.d/90-cn60.conf 644 <<'EOF'
+[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=50M
+EOF
+    systemctl restart systemd-journald || true
+
+    # Faster shutdown/reboot when a service hangs.
+    put_file /etc/systemd/system.conf.d/90-cn60.conf 644 <<'EOF'
+[Manager]
+DefaultTimeoutStopSec=15s
+EOF
+
+    # Never suspend or hibernate; don't wait for the network at boot.
+    local u
+    for u in sleep.target suspend.target hibernate.target hybrid-sleep.target \
+             NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
+        unit_exists "$u" || continue
+        [[ "$(unit_state "$u")" == masked ]] && continue
+        systemctl mask "$u" >/dev/null 2>&1 && record "$MASKED" "$u"
+    done
+
+    # Services a TV box does not need.
+    for u in ModemManager.service cups.service cups-browsed.service; do
+        [[ "$(unit_state "$u")" == enabled ]] || continue
+        systemctl disable --now "$u" >/dev/null 2>&1 && record "$DISABLED" "$u"
+    done
+
+    # Weekly SSD/eMMC TRIM.
+    if unit_exists fstrim.timer && [[ "$(unit_state fstrim.timer)" != enabled ]]; then
+        systemctl enable --now fstrim.timer >/dev/null 2>&1 && record "$ENABLED" fstrim.timer
+    fi
+
+    # Boot: 1 s GRUB menu, quiet boot, no console blanking.
+    if [[ -f /etc/default/grub ]] && command -v update-grub >/dev/null; then
+        backup_once /etc/default/grub
+        local f=/etc/default/grub cur new p key
+        set_kv "$f" GRUB_TIMEOUT 1
+        cur="$(sed -n 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/p' "$f" | tail -n1)"
+        new="$cur"
+        for p in quiet loglevel=3 consoleblank=0; do
+            key=${p%%=*}
+            if ! printf ' %s ' "$new" | grep -qE " $key(=| )"; then new="${new:+$new }$p"; fi
+        done
+        if [[ "$new" != "$cur" ]] || ! grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f"; then
+            new="$(printf '%s' "$new" | sed 's/[&|\\]/\\&/g')"
+            if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$f"; then
+                sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$new\"|" "$f"
+            else
+                echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$new\"" >> "$f"
+            fi
+        fi
+        update-grub || warn "update-grub failed; boot settings unchanged."
+    else
+        warn "GRUB not found; skipping boot tweaks."
+    fi
+    systemctl daemon-reload
+    return 0
+}
+
+# ---- SSH remote access (one-time step)
+setup_ssh() {
+    log "Setting up SSH remote access"
+    put_file /etc/ssh/sshd_config.d/90-cn60.conf 644 <<'EOF'
+# CN60: SSH for normal users only (removed by cn60-waydroid-setup.sh --uninstall)
+PermitRootLogin no
+MaxAuthTries 4
+X11Forwarding no
+EOF
+    if ! sshd -t; then
+        warn "SSH config test failed; removing the CN60 SSH settings."
+        rm -f /etc/ssh/sshd_config.d/90-cn60.conf
+        return 1
+    fi
+    if [[ "$(unit_state ssh.service)" != enabled ]]; then
+        systemctl enable ssh.service >/dev/null 2>&1 && record "$ENABLED" ssh.service
+    fi
+    systemctl restart ssh.service || { warn "SSH did not start: journalctl -u ssh -b"; return 1; }
+}
+
+# ---- Automatic updates (one-time step)
+setup_auto_updates() {
+    log "Turning on automatic updates"
+    # Daily: Debian security/stable updates through unattended-upgrades. Never auto-reboots.
+    put_file /etc/apt/apt.conf.d/20auto-upgrades 644 backup <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    put_file /etc/apt/apt.conf.d/52cn60-unattended 644 <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+    # Weekly: full upgrade + Android image via cn60-update (timer written in write_helpers).
+    systemctl daemon-reload
+    systemctl enable --now cn60-update.timer || { warn "Could not enable cn60-update.timer."; return 1; }
+}
+
+setup_waydroid() {
+    log "Checking the Waydroid container"
+    systemctl enable --now waydroid-container.service
+    if [[ ! -f /var/lib/waydroid/images/system.img ]]; then
+        log "Initialising Waydroid (vanilla, no GApps; downloads 1-2 GB)"
+        waydroid init -s VANILLA || die "waydroid init failed; fix the error above and re-run."
+        CHANGES+=("initialised Waydroid")
+    else
+        echo "  Waydroid images present"
+    fi
+}
+
+install_arm_translation() {
+    log "Installing ARM translation (libndk) for ARM-only apps (third-party project)"
+    if [[ ! -d /opt/waydroid_script/venv ]]; then
+        rm -rf /opt/waydroid_script
+        git clone --depth 1 https://github.com/casualsnek/waydroid_script /opt/waydroid_script \
+            || { warn "Could not clone waydroid_script; ARM apps unavailable."; return 1; }
+        python3 -m venv /opt/waydroid_script/venv || return 1
+        /opt/waydroid_script/venv/bin/pip install -q -r /opt/waydroid_script/requirements.txt \
+            || { warn "pip install for waydroid_script failed; ARM apps unavailable."; return 1; }
+    fi
+    /opt/waydroid_script/venv/bin/python3 /opt/waydroid_script/main.py install libndk \
+        || { warn "ARM translation install failed; x86 apps still work."; return 1; }
+}
+
+write_helpers() {
+    log "Checking the kiosk helpers and systemd units (only changed files are rewritten)"
+
+    # Settings menu (embedded, so this script is the only file you need).
+    put_file /usr/local/bin/cn60-settings 755 <<'CN60_SETTINGS_EOF'
+#!/usr/bin/env bash
+# CN60 settings menu: resolution, Bluetooth, TV power (HDMI-CEC), SSH info, updates.
+# Written by cn60-waydroid-setup.sh. Run with sudo from a console.
+set -uo pipefail
+
+CONF=/etc/cn60/display.conf
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-settings"; exit 1; }
+command -v whiptail >/dev/null || { echo "whiptail missing"; exit 1; }
+
+apply_resolution() {
+    local w="$1" h="$2"
+    mkdir -p /etc/cn60
+    printf 'WIDTH=%s\nHEIGHT=%s\n' "$w" "$h" > "$CONF"
+    waydroid prop set persist.waydroid.width "$w" || true
+    waydroid prop set persist.waydroid.height "$h" || true
+    systemctl restart waydroid-kiosk.service
+    whiptail --msgbox "Resolution set to ${w}x${h}. Kiosk restarted." 8 50
+}
+
+menu_resolution() {
+    local choice
+    choice=$(whiptail --title "Resolution" --menu "Choose a display mode" 15 60 5 \
+        1080p "1920x1080 (default)" \
+        4k    "3840x2160" \
+        720p  "1280x720" \
+        back  "Return" 3>&1 1>&2 2>&3) || return
+    case "$choice" in
+        4k)    apply_resolution 3840 2160 ;;
+        1080p) apply_resolution 1920 1080 ;;
+        720p)  apply_resolution 1280 720 ;;
+        back)  ;;
+    esac
+}
+
+# Bluetooth: devices pair with Debian. Keyboards, mice, gamepads and remotes then
+# work in Android as normal input; headphones/speakers play Android's sound.
+bt_pick() {   # bt_pick <filter: Paired|Connected|""> <title>; sets BT_MAC
+    local items=() mac name
+    while read -r _ mac name; do
+        [[ $mac =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] && items+=("$mac" "${name:-unknown}")
+    done < <(bluetoothctl devices $1 2>/dev/null)
+    if [[ ${#items[@]} -eq 0 ]]; then
+        whiptail --msgbox "No devices found." 7 40; return 1
+    fi
+    BT_MAC=$(whiptail --title "$2" --menu "Choose a device" 20 70 10 "${items[@]}" 3>&1 1>&2 2>&3)
+}
+
+bt_run() {    # show the commands' output on screen (passkeys appear here)
+    clear
+    echo "$1"; echo
+    shift
+    for c in "$@"; do echo "\$ bluetoothctl $c"; eval "bluetoothctl $c"; echo; done
+    read -rp "Press Enter to continue " _
+}
+
+bt_pair() {
+    whiptail --msgbox "Put the device in pairing mode now (usually hold its pairing or power button until a light flashes), then press OK. Scanning takes 20 seconds." 10 64
+    clear; echo "Scanning for 20 seconds..."
+    bluetoothctl --timeout 20 scan on >/dev/null 2>&1
+    bt_pick "" "Devices found" || return
+    bt_run "Pairing $BT_MAC. If a code appears, type it on the keyboard and press Enter." \
+        "pair $BT_MAC" "trust $BT_MAC" "connect $BT_MAC"
+}
+
+bt_status() {
+    local paired connected
+    paired=$(bluetoothctl devices Paired 2>/dev/null | cut -d' ' -f2-)
+    connected=$(bluetoothctl devices Connected 2>/dev/null | cut -d' ' -f2-)
+    whiptail --title "Bluetooth status" --msgbox \
+        "Paired:\n${paired:-none}\n\nConnected now:\n${connected:-none}" 20 74
+}
+
+menu_bluetooth() {
+    systemctl start bluetooth.service
+    rfkill unblock bluetooth 2>/dev/null || true
+    bluetoothctl power on >/dev/null 2>&1
+    local choice
+    while true; do
+        choice=$(whiptail --title "Bluetooth" --menu "Keyboards, mice, gamepads, remotes, headphones, speakers" 16 70 6 \
+            pair       "Scan and pair a new device" \
+            status     "Show paired and connected devices" \
+            connect    "Reconnect a paired device" \
+            disconnect "Disconnect a device" \
+            remove     "Forget a device" \
+            back       "Return" 3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            pair)       bt_pair ;;
+            status)     bt_status ;;
+            connect)    bt_pick Paired "Reconnect" && bt_run "Connecting $BT_MAC" "connect $BT_MAC" ;;
+            disconnect) bt_pick Connected "Disconnect" && bt_run "Disconnecting $BT_MAC" "disconnect $BT_MAC" ;;
+            remove)     bt_pick Paired "Forget" && bt_run "Removing $BT_MAC" "remove $BT_MAC" ;;
+            back)       return ;;
+        esac
+    done
+}
+
+menu_info() {
+    local ips ssh_state
+    ips=$(hostname -I 2>/dev/null)
+    ssh_state=$(systemctl is-active ssh.service 2>/dev/null)
+    whiptail --title "Network / SSH" --msgbox \
+        "IP address(es): ${ips:-none}\nSSH: ${ssh_state}\n\nFrom another computer:\n  ssh $(cat /etc/cn60/user 2>/dev/null)@<IP above>" 13 70
+}
+
+menu_tv_power() {
+    local choice
+    choice=$(whiptail --title "TV power (HDMI-CEC)" --menu "Control the TV" 12 60 3 \
+        on   "Turn TV on" \
+        off  "Put TV in standby" \
+        back "Return" 3>&1 1>&2 2>&3) || return
+    case "$choice" in
+        on)  echo 'on 0'  | cec-client -s -d 1 >/dev/null 2>&1 && whiptail --msgbox "Sent power-on." 7 40 || whiptail --msgbox "CEC command failed. Check the HDMI cable and that CEC is enabled on the TV." 9 60 ;;
+        off) echo 'standby 0' | cec-client -s -d 1 >/dev/null 2>&1 && whiptail --msgbox "Sent standby." 7 40 || whiptail --msgbox "CEC command failed." 7 40 ;;
+        back) ;;
+    esac
+}
+
+while true; do
+    choice=$(whiptail --title "CN60 Settings" --menu "Select" 18 60 8 \
+        resolution "Change display resolution" \
+        bluetooth  "Bluetooth devices" \
+        tv         "TV power on/off (CEC)" \
+        info       "IP address and SSH" \
+        restart    "Restart the Android kiosk" \
+        update     "Update Debian + Android now" \
+        reboot     "Reboot the box" \
+        exit       "Quit" 3>&1 1>&2 2>&3) || break
+    case "$choice" in
+        resolution) menu_resolution ;;
+        bluetooth)  menu_bluetooth ;;
+        tv)         menu_tv_power ;;
+        info)       menu_info ;;
+        restart)    systemctl restart waydroid-kiosk.service ;;
+        update)     clear; /usr/local/bin/cn60-update; read -rp "Press Enter to return to the menu " _ ;;
+        reboot)     whiptail --yesno "Reboot now?" 7 40 && systemctl reboot ;;
+        exit)       break ;;
+    esac
+done
+CN60_SETTINGS_EOF
+
+    # Updater: used by the weekly timer, the settings menu, and this script.
+    put_file /usr/local/bin/cn60-update 755 <<'CN60_UPDATE_EOF'
+#!/usr/bin/env bash
+# CN60 updater: upgrades Debian packages and the Waydroid Android image.
+#   sudo cn60-update               upgrade now, restart the kiosk if it was running
+#   sudo cn60-update --no-restart  leave the kiosk stopped (used by the setup script)
+#   sudo cn60-update --auto        weekly timer: also reboots if a new kernel was installed
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-update"; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+APT=(apt-get -y -o DPkg::Lock::Timeout=600
+     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+RESTART=1; AUTO=0
+for a in "$@"; do
+    case "$a" in --no-restart) RESTART=0 ;; --auto) AUTO=1 ;; esac
+done
+rc=0
+
+echo "==> Upgrading Debian packages"
+"${APT[@]}" update || rc=1
+"${APT[@]}" full-upgrade || rc=1
+"${APT[@]}" autoremove --purge || true
+"${APT[@]}" autoclean || true
+
+echo "==> Upgrading the Waydroid Android image"
+was_active=0
+if systemctl is-active --quiet waydroid-kiosk.service; then
+    was_active=1
+    systemctl stop waydroid-kiosk.service
+fi
+KUSER="$(cat /etc/cn60/user 2>/dev/null || true)"
+[[ -n $KUSER ]] && runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
+waydroid upgrade || { echo "Waydroid upgrade failed; Android keeps its current image."; rc=1; }
+
+newest="$(ls -1 /lib/modules | sort -V | tail -n1)"
+if [[ -n $newest && $newest != "$(uname -r)" ]]; then
+    echo "New kernel $newest installed. Reboot to use it: sudo reboot"
+    if [[ $AUTO -eq 1 ]]; then systemctl reboot; exit $rc; fi
+fi
+if [[ $was_active -eq 1 && $RESTART -eq 1 ]]; then
+    systemctl start waydroid-kiosk.service
+fi
+[[ $rc -eq 0 ]] && echo "Update finished." || echo "Update finished with errors (see above)."
+exit $rc
+CN60_UPDATE_EOF
+
+    # Runs as root: sets resolution, powers on the TV, then hands off to the user.
+    put_file /usr/local/bin/cn60-kiosk-start 755 <<'EOF'
+#!/bin/sh
+# Root part of the kiosk: apply resolution, wake the TV, start the user session.
+CONF=/etc/cn60/display.conf
+[ -r "$CONF" ] && . "$CONF"
+WIDTH="${WIDTH:-1920}"; HEIGHT="${HEIGHT:-1080}"
+KUSER="$(cat /etc/cn60/user)"
+UID_NUM="$(id -u "$KUSER")"
+
+waydroid prop set persist.waydroid.width "$WIDTH" || echo "cn60: could not set width" >&2
+waydroid prop set persist.waydroid.height "$HEIGHT" || echo "cn60: could not set height" >&2
+echo 'on 0' | timeout 10 cec-client -s -d 1 >/dev/null 2>&1 || true   # best effort, never blocks boot
+
+systemctl start "user@${UID_NUM}.service" || true
+exec runuser -u "$KUSER" -- env XDG_RUNTIME_DIR="/run/user/$UID_NUM" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_NUM/bus" \
+    cage -s -- /usr/local/bin/cn60-kiosk-user
+EOF
+
+    # Runs as the normal user inside cage: start Waydroid and show it fullscreen.
+    put_file /usr/local/bin/cn60-kiosk-user 755 <<'EOF'
+#!/bin/sh
+waydroid session stop >/dev/null 2>&1 || true
+waydroid session start >/dev/null 2>&1 &
+sleep 5
+exec waydroid show-full-ui
+EOF
+
+    put_file /etc/systemd/system/waydroid-kiosk.service 644 <<'EOF'
+[Unit]
+Description=CN60 Waydroid fullscreen kiosk
+After=waydroid-container.service seatd.service systemd-user-sessions.service network.target
+Wants=waydroid-container.service seatd.service systemd-user-sessions.service
+Conflicts=getty@tty1.service
+OnFailure=cn60-fallback.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+ExecStart=/usr/local/bin/cn60-kiosk-start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-kiosk.target
+EOF
+
+    # If the kiosk gives up, bring back a text login on tty1 so the box is not dead.
+    put_file /etc/systemd/system/cn60-fallback.service 644 <<'EOF'
+[Unit]
+Description=CN60 kiosk failed: restore text login on tty1
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl start getty@tty1.service
+EOF
+
+    put_file /etc/systemd/system/graphical-kiosk.target 644 <<'EOF'
+[Unit]
+Description=Boot target for the CN60 Waydroid kiosk
+# Pull in the normal system first (network, SSH, user logins), like graphical.target does.
+# Without this, /run/nologin is never removed and only root can log in.
+Requires=multi-user.target
+Wants=waydroid-kiosk.service
+After=multi-user.target waydroid-kiosk.service
+AllowIsolate=yes
+EOF
+
+    put_file /etc/systemd/system/cn60-update.service 644 <<'EOF'
+[Unit]
+Description=CN60 weekly update (Debian + Waydroid image)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cn60-update --auto
+EOF
+
+    put_file /etc/systemd/system/cn60-update.timer 644 <<'EOF'
+[Unit]
+Description=Run the CN60 update every Sunday at 04:30
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+}
+
+do_install() {
+    check_platform
+    # Earlier versions booted without systemd-user-sessions, leaving /run/nologin behind.
+    systemctl start systemd-user-sessions.service 2>/dev/null || true
+    local kiosk_was_active=0 prev="none"
+    systemctl is-active --quiet waydroid-kiosk.service 2>/dev/null && kiosk_was_active=1
+    [[ -r $STATE/version ]] && prev="$(cat "$STATE/version")"
+    if [[ -f $MARK ]]; then
+        log "Already installed (version $prev). Script version $SCRIPT_VERSION: adding only what is new."
+    fi
+
+    # Always-checked steps: each one is idempotent and only changes what is missing.
+    install_packages
+    [[ $UPGRADE -eq 1 ]] && upgrade_debian
+    ensure_user_groups
+    ensure_binder
+    write_config
+    setup_waydroid
+    write_helpers
+
+    # One-time steps: bump the number to make an existing install run the step again.
+    log "Checking one-time steps"
+    run_step arm-translation 1 install_arm_translation
+    run_step os-tuning       1 tune_os
+    run_step auto-updates    1 setup_auto_updates
+    run_step ssh             1 setup_ssh
+
+    if [[ $UPGRADE -eq 1 ]]; then
+        log "Upgrading the Waydroid Android image"
+        /usr/local/bin/cn60-update --no-restart >/dev/null 2>&1 \
+            && echo "  done" || warn "Android image upgrade failed; run 'sudo cn60-update' to see why."
+    fi
+
+    log "Checking the boot target"
+    systemctl enable --now seatd.service
+    systemctl disable --now display-manager.service 2>/dev/null || true
+    systemctl enable waydroid-kiosk.service
+    systemctl set-default graphical-kiosk.target
+
+    touch "$MARK"
+    echo "$SCRIPT_VERSION" > "$STATE/version"
+
+    if [[ $kiosk_was_active -eq 1 ]]; then
+        log "Restarting the kiosk to apply changes"
+        systemctl restart waydroid-kiosk.service || warn "Kiosk restart failed: journalctl -u waydroid-kiosk -b"
+    fi
+
+    echo
+    if [[ ${#CHANGES[@]} -eq 0 ]]; then
+        echo "Nothing new to add. Everything is up to date."
+    else
+        echo "Changes this run:"
+        printf '  - %s\n' "${CHANGES[@]}"
+    fi
+    newest="$(ls -1 /lib/modules | sort -V | tail -n1)"
+    [[ -n $newest && $newest != "$(uname -r)" ]] && echo "A new kernel ($newest) is installed: reboot to use it."
+
+    local ips
+    ips="$(hostname -I 2>/dev/null | xargs || true)"
+    cat <<EOM
+
+SSH from another computer:  ssh $KUSER@${ips%% *}     (all addresses: ${ips:-unknown})
+
+Next steps:
+  - Test without rebooting:   sudo systemctl start waydroid-kiosk
+  - Watch the logs:           journalctl -u waydroid-kiosk -b -f
+  - Settings menu:            Ctrl+Alt+F2, log in, run: sudo cn60-settings
+  - Update now:               sudo cn60-update
+  - Weekly auto-update:       systemctl list-timers cn60-update.timer
+  - Reboot to start the kiosk (and apply boot tweaks).
+  - Revert to a normal boot:  sudo systemctl set-default multi-user.target
+  - Uninstall everything:     sudo ./cn60-waydroid-setup.sh --uninstall
+EOM
+}
+
+# ------------------------------------------------------------ entry point
+if [[ $MODE == uninstall ]]; then
+    do_uninstall
+else
+    do_install
+fi
