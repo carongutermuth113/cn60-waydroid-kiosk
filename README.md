@@ -19,7 +19,7 @@ install. Run it again later to add only what is new.
 |---|---|
 | **Android** | [Waydroid](https://waydro.id) with the VANILLA image (no Google apps), shown full screen at boot |
 | **Kiosk** | No desktop environment. `cage` (a single-app Wayland compositor) runs Android on tty1 |
-| **ARM apps** | libndk ARM translation through [casualsnek/waydroid_script](https://github.com/casualsnek/waydroid_script), so ARM-only apps can run |
+| **ARM apps** | ARM translation (libhoudini on Intel, libndk on AMD) through [casualsnek/waydroid_script](https://github.com/casualsnek/waydroid_script), so ARM-only apps can run |
 | **Display** | Resolution set from a config file: 1080p (default), 4K or 720p |
 | **TV control** | Turns the TV on at boot and has on/standby buttons over HDMI-CEC |
 | **Sound** | PipeWire (or PulseAudio, if already installed) for HDMI and Bluetooth audio |
@@ -30,6 +30,7 @@ install. Run it again later to add only what is new.
 | **Aurora Store** | Optional (the installer asks): open-source Google Play client, from F-Droid |
 | **Remote screen** | See and control Android from a PC with scrcpy, through an SSH tunnel |
 | **Notifications** | Android notification when a new script version, Debian updates or a reboot is waiting |
+| **Low RAM (4 GB)** | zram + swap file, bigger app memory limit, Android protected from the OOM killer, kiosk restarts by itself, `cn60-crashlog` explains crashes |
 | **OS tuning** | zram swap, journal size cap, no suspend, quiet fast boot, unneeded services off |
 | **Settings menu** | `sudo cn60-settings`: text menu on Ctrl+Alt+F2 |
 | **Safe re-runs** | Re-running applies only new or changed parts and keeps your settings |
@@ -127,7 +128,7 @@ power on
 7. **Waydroid.** Enables the container service and runs `waydroid init -s VANILLA` if no image exists yet.
 8. **Helpers and units.** Writes the scripts in `/usr/local/bin` and the systemd units. A file is rewritten only when its content changed.
 9. **One-time steps,** each tracked with a version number:
-   - `arm-translation`: libndk through waydroid_script
+   - `arm-translation`: libhoudini (Intel) or libndk (AMD) through waydroid_script
    - `os-tuning`: see [OS tuning](#os-tuning)
    - `auto-updates`: unattended-upgrades plus the weekly timer
    - `ssh`: sshd hardening drop-in, service enabled
@@ -170,6 +171,7 @@ sudo cn60-settings
 | `info` | IP address and SSH status |
 | `remote` | How to see this screen on a PC (scrcpy) |
 | `apps` | Install Aurora Store |
+| `crashes` | Crash report: why apps close (same as `sudo cn60-crashlog`) |
 | `restart` | Restart Android |
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
@@ -248,7 +250,7 @@ sudo cn60-apps list       # installed Android apps
 
 Limits: apps that need Google Play Services (many Google apps, some games,
 banking, Netflix-style DRM apps) may refuse to run. ARM-only apps work through
-the libndk translation, but not all of them.
+the ARM translation, but not all of them.
 
 ---
 
@@ -401,8 +403,11 @@ All of these are undone by `--uninstall`.
 
 | Tweak | Why |
 |---|---|
-| zram swap (zstd, 50% of RAM) | Compressed RAM swap; smoother on low-memory boxes |
-| `vm.swappiness=10`, `vm.vfs_cache_pressure=50` | Keep apps in RAM longer |
+| zram swap (zstd, 100% of RAM, priority 100) | Compressed RAM swap; idle memory takes about a third of the space |
+| 4 GB swap file `/cn60.swap` (priority 10) | Last resort when zram is full, so apps are not killed. Only on ext4/xfs with 12 GB free |
+| `vm.swappiness=150`, `page-cluster=0`, `watermark_scale_factor=125` | Use the fast zram swap early instead of running out of memory |
+| `OOMScoreAdjust=-500` for `waydroid-container` and the kiosk | Debian's OOM killer picks something else before Android |
+| Android `dalvik.vm.heapgrowthlimit=256m`, `heapsize=512m` (waydroid.cfg `[properties]`) | Heavy apps do not die with OutOfMemoryError |
 | Journal capped at 200 MB | Disk never fills with logs |
 | `DefaultTimeoutStopSec=15s` | Shutdown never hangs on a stuck service |
 | Suspend / hibernate masked | A TV box should never go to sleep |
@@ -430,6 +435,8 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
 | `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
 | `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store) |
+| `/usr/local/bin/cn60-crashlog` | Crash report, saved to `/var/log/cn60-crash-report.txt` |
+| `/cn60.swap`, `/etc/cn60/swapfile` | Swap file and its record for uninstall |
 | `/etc/cn60/options` | Answers to install questions (`AURORA_STORE=yes/no`) |
 | `/etc/cn60/pending-apps` | Apps waiting for Android to be running |
 | `/usr/local/lib/cn60/cn60-waydroid-setup.sh` | Installed copy of this script |
@@ -524,6 +531,17 @@ Run `sudo cn60-remote` on the box. It turns on network ADB inside Android if
 it is off. "Unauthorized" means the *Allow USB debugging?* prompt on the TV
 has not been accepted yet. Check the TV screen.
 
+**Apps crash or close (4 GB RAM)**
+Script v11 adds more swap (zram + a swap file), a bigger app memory limit,
+OOM protection for Android, Intel's libhoudini ARM translation instead of
+libndk, and restarts the kiosk if Android's screen closes. If an app still
+closes, run `sudo cn60-crashlog --clear`, open the app until it closes, then
+`sudo cn60-crashlog`. The end of the report says the likely cause:
+- *needs Google Play Services*: the VANILLA image has none. RAM does not help;
+  it needs a GApps or microG image.
+- *ARM translation*: re-run `sudo /usr/local/lib/cn60/cn60-waydroid-setup.sh --force`.
+- *RAM was full*: use 1080p instead of 4K and keep few apps open.
+
 **Black screen / kiosk keeps restarting**
 Check `journalctl -u waydroid-kiosk -b` and `sudo waydroid log`. After 3
 failures you get a text login on tty1 automatically.
@@ -551,7 +569,7 @@ run the uninstall at the box, not over SSH.
 
 - [Waydroid](https://waydro.id)
 - [cage](https://github.com/cage-kiosk/cage)
-- [casualsnek/waydroid_script](https://github.com/casualsnek/waydroid_script) for the libndk ARM translation (third-party; check its license)
+- [casualsnek/waydroid_script](https://github.com/casualsnek/waydroid_script) for the libhoudini/libndk ARM translation (third-party; check its license)
 
 ## License
 

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=10              # bump when the script changes
+SCRIPT_VERSION=11              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -197,10 +197,19 @@ do_uninstall() {
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
           /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
           /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /usr/local/bin/cn60-apps \
-          /etc/update-motd.d/90-cn60
-    rm -rf /usr/local/lib/cn60 /var/lib/cn60
+          /usr/local/bin/cn60-crashlog /etc/update-motd.d/90-cn60
+    rm -rf /usr/local/lib/cn60 /var/lib/cn60 /etc/systemd/system/waydroid-container.service.d/90-cn60.conf
 
     log "Reverting OS tweaks"
+    if [[ -r $STATE/swapfile ]]; then
+        local sf
+        sf="$(cat "$STATE/swapfile")"
+        if [[ -n $sf ]]; then
+            swapoff "$sf" 2>/dev/null || warn "Could not turn off $sf (not enough free RAM?); it is removed after reboot."
+            sed -i "\|^${sf}[[:space:]]|d" /etc/fstab
+            rm -f "$sf"
+        fi
+    fi
     rm -f /etc/sysctl.d/90-cn60.conf \
           /etc/systemd/journald.conf.d/90-cn60.conf \
           /etc/systemd/system.conf.d/90-cn60.conf \
@@ -344,25 +353,7 @@ upgrade_debian() {
 # ---- OS tuning (one-time step; bump its version in do_install when it changes)
 tune_os() {
     log "Tuning the OS for kiosk use"
-
-    # Memory: compressed RAM swap, keep apps in RAM longer.
-    put_file /etc/sysctl.d/90-cn60.conf 644 <<'EOF'
-# CN60 kiosk tuning (removed by cn60-waydroid-setup.sh --uninstall)
-vm.swappiness=10
-vm.vfs_cache_pressure=50
-EOF
-    sysctl --system >/dev/null 2>&1 || warn "sysctl reload failed; applies after reboot."
-
-    if [[ -f /etc/default/zramswap ]]; then
-        backup_once /etc/default/zramswap
-        set_kv /etc/default/zramswap ALGO zstd
-        set_kv /etc/default/zramswap PERCENT 50
-        set_kv /etc/default/zramswap PRIORITY 100
-        systemctl enable zramswap.service >/dev/null 2>&1 || true
-        systemctl restart zramswap.service || warn "zram swap did not start; continuing."
-    else
-        warn "zram-tools config missing; skipping zram swap."
-    fi
+    # Memory (sysctl, zram, swap file) is handled by tune_memory, which runs every time.
 
     # Logs: cap the journal so the disk does not fill up over months.
     put_file /etc/systemd/journald.conf.d/90-cn60.conf 644 <<'EOF'
@@ -524,18 +515,158 @@ setup_waydroid() {
     fi
 }
 
+# stop_android: stop the kiosk and the Android session before changing the Android image.
+# do_install restarts the kiosk at the end if it was running when the script started.
+stop_android() {
+    systemctl stop waydroid-kiosk.service 2>/dev/null || true
+    runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
+}
+
+# ---- ARM translation (one-time step)
+# Most Play Store apps ship ARM code only. Intel CPUs (the CN60) run it best with Intel's
+# libhoudini; libndk (used up to script v10) suits AMD and makes many apps crash on Intel.
 install_arm_translation() {
-    log "Installing ARM translation (libndk) for ARM-only apps (third-party project)"
+    local arm=libndk arm_old=libhoudini py=/opt/waydroid_script/venv/bin/python3
+    if grep -q GenuineIntel /proc/cpuinfo; then arm=libhoudini; arm_old=libndk; fi
+    log "Installing ARM translation ($arm) for ARM-only apps (third-party project)"
     if [[ ! -d /opt/waydroid_script/venv ]]; then
         rm -rf /opt/waydroid_script
         git clone --depth 1 https://github.com/casualsnek/waydroid_script /opt/waydroid_script \
             || { warn "Could not clone waydroid_script; ARM apps unavailable."; return 1; }
         python3 -m venv /opt/waydroid_script/venv || return 1
-        /opt/waydroid_script/venv/bin/pip install -q -r /opt/waydroid_script/requirements.txt \
-            || { warn "pip install for waydroid_script failed; ARM apps unavailable."; return 1; }
+    else
+        git -C /opt/waydroid_script pull -q --ff-only || warn "Could not update waydroid_script; using the old copy."
     fi
-    /opt/waydroid_script/venv/bin/python3 /opt/waydroid_script/main.py install libndk \
+    /opt/waydroid_script/venv/bin/pip install -q -r /opt/waydroid_script/requirements.txt \
+        || { warn "pip install for waydroid_script failed; ARM apps unavailable."; return 1; }
+    stop_android
+    # Only one translator may be installed; remove the other one (harmless if it is absent).
+    (cd /opt/waydroid_script && "$py" main.py uninstall "$arm_old") >/dev/null 2>&1 || true
+    (cd /opt/waydroid_script && "$py" main.py install "$arm") \
         || { warn "ARM translation install failed; x86 apps still work."; return 1; }
+}
+
+# ---- Low-RAM tuning (always checked)
+# The CN60 has 4 GB of RAM. Debian + Android + one big app do not fit, so the kernel or
+# Android's memory killer closes apps. Fix: compressed RAM swap (zram, about 3:1) used early,
+# plus a swap file on disk as the last resort before anything is killed.
+SWAPFILE=/cn60.swap
+SWAP_GB=4
+tune_memory() {
+    log "Checking low-memory tuning (4 GB RAM)"
+    put_file /etc/sysctl.d/90-cn60.conf 644 <<'EOF'
+# CN60 kiosk memory tuning for 4 GB RAM (removed by cn60-waydroid-setup.sh --uninstall)
+# zram swap is fast, so move idle memory there early instead of killing apps.
+vm.swappiness=150
+vm.page-cluster=0
+vm.watermark_scale_factor=125
+vm.watermark_boost_factor=0
+vm.vfs_cache_pressure=100
+EOF
+    sysctl --system >/dev/null 2>&1 || warn "sysctl reload failed; applies after reboot."
+
+    # zram: compressed swap in RAM, size = 100% of RAM (zstd), used before the disk.
+    if [[ -f /etc/default/zramswap ]]; then
+        backup_once /etc/default/zramswap
+        local before
+        before="$(cat /etc/default/zramswap)"
+        set_kv /etc/default/zramswap ALGO zstd
+        set_kv /etc/default/zramswap PERCENT 100
+        set_kv /etc/default/zramswap PRIORITY 100
+        systemctl enable zramswap.service >/dev/null 2>&1 || true
+        if ! swapon --show=NAME --noheadings | grep -q zram; then
+            systemctl restart zramswap.service && CHANGES+=("zram swap on (100% of RAM, zstd)") \
+                || warn "zram swap did not start; continuing."
+        elif [[ "$before" != "$(cat /etc/default/zramswap)" ]]; then
+            # Restarting zram now would pull everything swapped back into RAM at once.
+            CHANGES+=("zram swap resized to 100% of RAM (applies after reboot)")
+        fi
+    else
+        warn "zram-tools config missing; skipping zram swap."
+    fi
+
+    # Swap file on disk: used only when zram is full (lower priority).
+    if swapon --show=NAME --noheadings | grep -qx "$SWAPFILE"; then
+        :
+    elif [[ -f $SWAPFILE ]]; then
+        swapon -p 10 "$SWAPFILE" 2>/dev/null || warn "Could not enable $SWAPFILE."
+    else
+        local fs avail
+        fs="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+        avail="$(df --output=avail -BG / 2>/dev/null | tail -n1 | tr -dc 0-9)"
+        if [[ $fs != ext4 && $fs != xfs ]]; then
+            warn "Swap file skipped: the root filesystem is '${fs:-unknown}', not ext4/xfs."
+        elif (( ${avail:-0} < SWAP_GB + 8 )); then
+            warn "Swap file skipped: only ${avail:-0} GB free on / (need $((SWAP_GB + 8)) GB)."
+        elif fallocate -l "${SWAP_GB}G" "$SWAPFILE" && chmod 600 "$SWAPFILE" \
+             && mkswap -L cn60swap "$SWAPFILE" >/dev/null && swapon -p 10 "$SWAPFILE"; then
+            echo "$SWAPFILE" > "$STATE/swapfile"
+            CHANGES+=("added a ${SWAP_GB} GB swap file ($SWAPFILE)")
+        else
+            swapoff "$SWAPFILE" 2>/dev/null || true
+            rm -f "$SWAPFILE"
+            warn "Could not create the swap file; continuing with zram only."
+        fi
+    fi
+    if [[ -f $SWAPFILE ]] && ! grep -q "^${SWAPFILE}[[:space:]]" /etc/fstab; then
+        backup_once /etc/fstab
+        echo "$SWAPFILE none swap sw,pri=10 0 0" >> /etc/fstab
+        CHANGES+=("swap file enabled at boot (/etc/fstab)")
+        systemctl daemon-reload
+    fi
+
+    # If Debian itself runs out of memory, its OOM killer must pick something other than
+    # Android's container or the kiosk screen (that would close everything at once).
+    put_file /etc/systemd/system/waydroid-container.service.d/90-cn60.conf 644 <<'EOF'
+# CN60: protect Android from the host OOM killer (removed by --uninstall)
+[Service]
+OOMScoreAdjust=-500
+EOF
+    systemctl daemon-reload
+    return 0
+}
+
+# ---- Android memory settings (always checked)
+# Bigger per-app Java heap: heavy apps (video, games) otherwise die with OutOfMemoryError.
+# Written to the [properties] section of waydroid.cfg; Waydroid copies it into the
+# Android image's properties on every `waydroid upgrade` (also --offline), so it survives updates.
+ANDROID_PROPS=(dalvik.vm.heapgrowthlimit=256m dalvik.vm.heapsize=512m)
+tune_android() {
+    log "Checking Android memory settings"
+    local cfg=/var/lib/waydroid/waydroid.cfg out
+    [[ -f $cfg ]] || { warn "$cfg missing; skipping Android memory settings."; return 0; }
+    out="$(python3 - "$cfg" "${ANDROID_PROPS[@]}" <<'PY'
+import configparser, sys
+path, props = sys.argv[1], sys.argv[2:]
+c = configparser.ConfigParser()
+c.read(path)
+if not c.has_section("properties"):
+    c.add_section("properties")
+changed = False
+for kv in props:
+    k, v = kv.split("=", 1)
+    if c.get("properties", k, fallback=None) != v:
+        c.set("properties", k, v)
+        changed = True
+if changed:
+    with open(path + ".cn60new", "w") as f:
+        c.write(f)
+    print("changed")
+PY
+)" || { warn "Could not edit $cfg."; rm -f "$cfg.cn60new"; return 0; }
+    if [[ $out == changed ]]; then
+        backup_once "$cfg"
+        mv -f "$cfg.cn60new" "$cfg"
+        stop_android
+        if waydroid upgrade --offline >/dev/null 2>&1; then
+            CHANGES+=("Android: larger app memory limit (${ANDROID_PROPS[*]})")
+        else
+            warn "waydroid upgrade --offline failed; the Android memory settings apply after the next 'sudo cn60-update'."
+        fi
+    else
+        echo "  Android memory settings present"
+    fi
+    return 0
 }
 
 write_helpers() {
@@ -673,12 +804,13 @@ menu_tv_power() {
 while true; do
     status_line=$(cat /etc/cn60/status 2>/dev/null)
     choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
-        --menu "${status_line:-Everything is up to date.}" 22 70 11 \
+        --menu "${status_line:-Everything is up to date.}" 23 70 12 \
         resolution "Change display resolution" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
         remote     "See this screen on a PC (scrcpy)" \
+        crashes    "Why do apps close? (crash report)" \
         apps       "Install Aurora Store (Google Play client)" \
         restart    "Restart the Android kiosk" \
         check      "Check for updates" \
@@ -691,6 +823,7 @@ while true; do
         tv)         menu_tv_power ;;
         info)       menu_info ;;
         remote)     clear; /usr/local/bin/cn60-remote; read -rp "Press Enter to return to the menu " _ ;;
+        crashes)    clear; /usr/local/bin/cn60-crashlog | less -R; ;;
         apps)       if whiptail --yesno "Install Aurora Store?\n\nIt downloads apps from Google Play without Google's apps. Apps that need Google Play Services may not work." 11 64; then
                         clear; /usr/local/bin/cn60-apps aurora; read -rp "Press Enter to return to the menu " _
                     fi ;;
@@ -925,6 +1058,81 @@ case "${1:-}" in
 esac
 CN60_APPS_EOF
 
+    # Crash report: tells in plain words why Android apps close.
+    put_file /usr/local/bin/cn60-crashlog 755 <<'CN60_CRASHLOG_EOF'
+#!/usr/bin/env bash
+# CN60 crash report: why do Android apps crash or close?
+#   sudo cn60-crashlog          show the report and save it to /var/log/cn60-crash-report.txt
+#   sudo cn60-crashlog --clear  empty Android's crash log; then open the app that crashes and
+#                               run sudo cn60-crashlog again, so only that crash is shown
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-crashlog"; exit 1; }
+OUT=/var/log/cn60-crash-report.txt
+ash() { timeout 30 waydroid shell -- "$@" 2>/dev/null; }
+android_up=0
+waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && android_up=1
+
+if [[ ${1:-} == --clear ]]; then
+    [[ $android_up -eq 1 ]] || { echo "Android is not running."; exit 1; }
+    ash /system/bin/logcat -c -b all
+    echo "Crash log cleared. Now open the app that crashes, then run: sudo cn60-crashlog"
+    exit 0
+fi
+
+report="$(
+    echo "CN60 crash report, $(date '+%F %T')"
+    echo; echo "== Debian memory"
+    free -h; swapon --show
+    echo "memory pressure: $(head -n1 /proc/pressure/memory 2>/dev/null)"
+    echo; echo "== Debian out-of-memory kills (this boot)"
+    journalctl -k -b --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 15
+    if [[ $android_up -eq 1 ]]; then
+        echo; echo "== Android settings"
+        for p in ro.product.cpu.abilist ro.dalvik.vm.native.bridge dalvik.vm.heapgrowthlimit \
+                 dalvik.vm.heapsize persist.waydroid.width persist.waydroid.height; do
+            echo "$p=$(ash /system/bin/getprop "$p" | tr -d '\r')"
+        done
+        echo; echo "== Android low-memory kills (last 20)"
+        ash /system/bin/logcat -d -b main,system,events | tr -d '\r' \
+            | grep -iE 'lowmemorykiller|lmkd.*kill|am_kill' | tail -n 20
+        echo; echo "== App crashes (newest last)"
+        ash /system/bin/logcat -d -b crash | tr -d '\r' | tail -n 150
+    else
+        echo; echo "Android is not running, so its crash log cannot be read."
+    fi
+)"
+
+# Plain-language hints from the report (the settings section is left out of the matching).
+src="$(sed '/^== Android settings/,/^== Android low-memory/d' <<< "$report")"
+hints=()
+if [[ $android_up -eq 1 ]] && grep -qE '^ro\.dalvik\.vm\.native\.bridge=(0)?$' <<< "$report"; then
+    hints+=("ARM translation is not active, so ARM-only apps cannot start. Re-run: sudo /usr/local/lib/cn60/cn60-waydroid-setup.sh --force")
+fi
+grep -qiE 'com\.google\.android\.gms|GooglePlayServices|play services' <<< "$src" && \
+    hints+=("An app needs Google Play Services, which the VANILLA Android image does not have. Such apps (YouTube, Netflix, Google apps, many games) close right after opening. Fixing this needs a different Android image (GApps or microG).")
+grep -qiE 'UnsatisfiedLinkError|couldn.t find "lib|dlopen failed|libhoudini|libndk' <<< "$src" && \
+    hints+=("An app has ARM-only code that did not load: ARM translation is missing or failing. Re-run: sudo /usr/local/lib/cn60/cn60-waydroid-setup.sh --force")
+grep -qi 'OutOfMemoryError' <<< "$src" && \
+    hints+=("An app ran out of its Java memory limit (OutOfMemoryError).")
+grep -qiE 'lowmemorykiller|am_kill' <<< "$src" && \
+    hints+=("Android closed apps because RAM was full. Use 1080p instead of 4K (Settings > resolution) and keep few apps open.")
+grep -qiE 'oom-kill|out of memory' <<< "$src" && \
+    hints+=("Debian ran out of memory and killed processes. Check that swap is on (the 'Debian memory' section above should list zram and /cn60.swap).")
+grep -qiE 'libEGL|libGLES|gralloc|mesa|iris|i965|SIGSEGV' <<< "$src" && \
+    hints+=("A native crash (possibly graphics/GPU). Send this report for a closer look.")
+
+{
+    echo "$report"
+    echo; echo "== What this probably means"
+    if [[ ${#hints[@]} -eq 0 ]]; then
+        echo "- No known cause found. Run 'sudo cn60-crashlog --clear', open the app until it crashes, then run 'sudo cn60-crashlog' again."
+    else
+        printf -- '- %s\n' "${hints[@]}"
+    fi
+    echo; echo "Saved to $OUT"
+} | tee "$OUT"
+CN60_CRASHLOG_EOF
+
     # Shown when you log in over SSH or on a console.
     put_file /etc/update-motd.d/90-cn60 755 <<'EOF'
 #!/bin/sh
@@ -1025,9 +1233,14 @@ EOF
     # Runs as the normal user inside cage: start Waydroid and show it fullscreen.
     put_file /usr/local/bin/cn60-kiosk-user 755 <<'EOF'
 #!/bin/sh
+# Start Android, wait until it is really up (slow with 4 GB RAM), then show it fullscreen.
 waydroid session stop >/dev/null 2>&1 || true
 waydroid session start >/dev/null 2>&1 &
-sleep 5
+i=0
+while [ "$i" -lt 120 ]; do
+    waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING' && break
+    sleep 1; i=$((i + 1))
+done
 exec waydroid show-full-ui
 EOF
 
@@ -1046,8 +1259,11 @@ TTYPath=/dev/tty1
 StandardInput=tty
 StandardOutput=journal
 ExecStart=/usr/local/bin/cn60-kiosk-start
-Restart=on-failure
-RestartSec=5
+# If Android's screen closes for any reason, bring it straight back.
+Restart=always
+RestartSec=3
+# Debian's OOM killer should pick something else before the kiosk screen.
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=graphical-kiosk.target
@@ -1147,16 +1363,20 @@ do_install() {
     write_config
     setup_waydroid
     write_helpers
+    tune_memory
 
     # One-time steps: bump the number to make an existing install run the step again.
     log "Checking one-time steps"
-    run_step arm-translation 1 install_arm_translation
+    run_step arm-translation 2 install_arm_translation
     run_step os-tuning       1 tune_os
     run_step auto-updates    1 setup_auto_updates
     run_step ssh             1 setup_ssh
     run_step self-update     1 setup_self_update
     run_step network-clash   1 fix_network_clash
     run_step bt-audio        1 fix_bt_audio
+
+    # After ARM translation: both edit waydroid.cfg [properties].
+    tune_android
 
     if [[ $UPGRADE -eq 1 ]]; then
         log "Upgrading the Waydroid Android image"
@@ -1207,6 +1427,7 @@ Next steps:
   - Update now:               sudo cn60-update
   - Check for updates:        sudo cn60-check
   - See the screen on a PC:   sudo cn60-remote
+  - Why do apps close?        sudo cn60-crashlog
   - Install Aurora Store:     sudo cn60-apps aurora
   - Self-update settings:     sudo nano /etc/cn60/update.conf
   - Weekly auto-update:       systemctl list-timers cn60-update.timer
