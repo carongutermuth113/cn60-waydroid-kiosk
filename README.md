@@ -53,7 +53,6 @@ On the CN60, logged in as your normal user:
 ```bash
 # get the script
 wget https://raw.githubusercontent.com/carongutermuth113/cn60-waydroid-kiosk/main/cn60-waydroid-setup.sh
-# (private repo: copy it over with scp or a USB stick instead)
 
 chmod +x cn60-waydroid-setup.sh
 sudo ./cn60-waydroid-setup.sh
