@@ -166,6 +166,7 @@ sudo cn60-settings
 | Option | What it does |
 |---|---|
 | `resolution` | 1080p (default), 4K (3840x2160) or 720p. Saves the choice and restarts Android |
+| `perf` | Performance overlay: FPS, CPU, RAM and GPU in the top-right corner of the TV (see below) |
 | `tweaks` | TV tweaks: hide phone apps, scaling (DPI), hide the bottom bar, Android time zone (see below) |
 | `bluetooth` | Scan/pair, status, reconnect, disconnect, forget devices |
 | `tv` | TV on / standby over HDMI-CEC |
@@ -177,6 +178,27 @@ sudo cn60-settings
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
 | `reboot` | Reboot the box |
+
+---
+
+## Performance overlay
+
+Shows **FPS, CPU, RAM and GPU** usage in the top-right corner of the TV. Off by default.
+
+```bash
+sudo cn60-perf overlay on    # show it on the TV (installs labwc + waybar the first time, restarts Android)
+sudo cn60-perf overlay off   # hide it
+sudo cn60-perf               # same numbers live in the terminal (Ctrl+C to stop)
+```
+
+Or `sudo cn60-settings` → **perf**.
+
+- **FPS** = frames Android drew in the last second. It is **0 when nothing moves on screen**; that is normal.
+- **CPU** = whole box, **RAM** = used / total, **GPU** = Intel render engine busy (`intel_gpu_top`).
+- cage cannot draw on top of Android, so with the overlay on the kiosk runs
+  [labwc](https://labwc.github.io/) instead (same wlroots base, no borders, Android full screen)
+  and [waybar](https://github.com/Alexays/Waybar) draws the box. With it off, cage is used as before.
+- The overlay and its stats service (`cn60-perf.service`) cost about 1-2% CPU.
 
 ---
 
@@ -463,7 +485,7 @@ edit. Units the script masks, disables or enables are recorded under
 
 | Path | Purpose |
 |---|---|
-| `/etc/cn60/display.conf` | Resolution (`WIDTH=`, `HEIGHT=`) |
+| `/etc/cn60/display.conf` | Resolution (`WIDTH=`, `HEIGHT=`), performance overlay (`OVERLAY=1/0`) |
 | `/etc/cn60/user` | Kiosk user |
 | `/etc/cn60/version`, `installed`, `steps/` | Install state for safe re-runs |
 | `/etc/cn60/packages-added`, `groups-added`, `masked`, `disabled`, `enabled`, `backup/` | What uninstall will revert |
@@ -472,6 +494,7 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
 | `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
 | `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store, AT4K, any .apk) |
+| `/usr/local/bin/cn60-perf`, `/usr/local/lib/cn60/perf-collector.py`, `/etc/systemd/system/cn60-perf.service` | Performance overlay (labwc/waybar config in `/usr/local/lib/cn60/`) |
 | `/usr/local/bin/cn60-tweaks` | TV tweaks (hide apps, scaling, bottom bar, time zone) |
 | `/usr/local/bin/cn60-crashlog` | Crash report, saved to `/var/log/cn60-crash-report.txt` |
 | `/cn60.swap`, `/etc/cn60/swapfile` | Swap file and its record for uninstall |

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=15              # bump when the script changes
+SCRIPT_VERSION=16              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -181,7 +181,7 @@ do_uninstall() {
     fi
 
     log "Stopping the kiosk and returning to a normal boot"
-    systemctl disable --now waydroid-kiosk.service cn60-update.timer cn60-check.timer 2>/dev/null || true
+    systemctl disable --now waydroid-kiosk.service cn60-update.timer cn60-check.timer cn60-perf.service 2>/dev/null || true
     systemctl set-default multi-user.target
     runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
     systemctl disable --now waydroid-container.service 2>/dev/null || true
@@ -193,11 +193,12 @@ do_uninstall() {
           /etc/systemd/system/cn60-update.service \
           /etc/systemd/system/cn60-update.timer \
           /etc/systemd/system/cn60-check.service \
-          /etc/systemd/system/cn60-check.timer
+          /etc/systemd/system/cn60-check.timer \
+          /etc/systemd/system/cn60-perf.service
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
           /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
           /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /usr/local/bin/cn60-apps \
-          /usr/local/bin/cn60-crashlog /usr/local/bin/cn60-tweaks /etc/update-motd.d/90-cn60
+          /usr/local/bin/cn60-crashlog /usr/local/bin/cn60-tweaks /usr/local/bin/cn60-perf /etc/update-motd.d/90-cn60
     rm -rf /usr/local/lib/cn60 /var/lib/cn60 /etc/systemd/system/waydroid-container.service.d/90-cn60.conf
 
     log "Reverting OS tweaks"
@@ -840,9 +841,10 @@ menu_tweaks() {
 while true; do
     status_line=$(cat /etc/cn60/status 2>/dev/null)
     choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
-        --menu "${status_line:-Everything is up to date.}" 24 70 13 \
+        --menu "${status_line:-Everything is up to date.}" 25 70 14 \
         resolution "Change display resolution" \
         tweaks     "TV tweaks: hide apps, scaling, bottom bar, clock" \
+        perf       "Performance overlay: FPS, CPU, RAM, GPU on screen" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
@@ -857,6 +859,14 @@ while true; do
     case "$choice" in
         resolution) menu_resolution ;;
         tweaks)     menu_tweaks ;;
+        perf)       v=$(whiptail --title "Performance overlay" --menu "Now: $(/usr/local/bin/cn60-perf status | head -n 1). Shows FPS, CPU, RAM and GPU top right. Android restarts." 12 70 3 \
+                        on   "Show the numbers on the TV" \
+                        off  "Hide them" \
+                        live "Show them here instead (Ctrl+C to stop)" 3>&1 1>&2 2>&3) &&
+                    case "$v" in
+                        live) clear; /usr/local/bin/cn60-perf ;;
+                        *)    clear; /usr/local/bin/cn60-perf overlay "$v"; read -rp "Press Enter to return to the menu " _ ;;
+                    esac ;;
         bluetooth)  menu_bluetooth ;;
         tv)         menu_tv_power ;;
         info)       menu_info ;;
@@ -1048,6 +1058,261 @@ case $cmd in
     *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 CN60_TWEAKS_EOF
+
+    # Performance overlay (optional, off by default): FPS, CPU, RAM, GPU on the TV.
+    # cage cannot draw anything on top of Android, so with the overlay on the kiosk runs
+    # labwc (same wlroots base) and waybar shows a small box in the top-right corner.
+    put_file /usr/local/lib/cn60/perf-collector.py 755 <<'CN60_PERF_PY_EOF'
+#!/usr/bin/env python3
+"""CN60 performance numbers: FPS, CPU, RAM, GPU.
+
+FPS = frames Android put on screen in the last second (SurfaceFlinger page flips).
+It drops to 0 when nothing moves on screen; that is normal, not a hang.
+GPU = Intel render engine busy % (intel_gpu_top); n/a on other GPUs.
+  perf-collector.py           print one line per second (Ctrl+C to stop)
+  perf-collector.py --daemon  write the line to /run/cn60/perf.txt for the overlay
+"""
+import json, os, re, subprocess, sys, threading, time
+
+OUT = "/run/cn60/perf.txt"
+LXC = ["lxc-attach", "-P", "/var/lib/waydroid/lxc", "-n", "waydroid", "--clear-env", "--"]
+state = {"fps": None, "gpu": None}
+
+
+def fps_thread():
+    # One long-running shell inside Android asks SurfaceFlinger for its page-flip
+    # counter every second (transaction 1013); the difference over time is the FPS.
+    loop = "while :; do /system/bin/service call SurfaceFlinger 1013; sleep 1; done"
+    while True:
+        try:
+            p = subprocess.Popen(LXC + ["/system/bin/sh", "-c", loop], text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            last = last_t = None
+            for line in p.stdout:
+                m = re.search(r"Parcel\(([0-9a-f]{8})", line)
+                if not m:
+                    continue
+                n, t = int(m.group(1), 16), time.monotonic()
+                if last is not None and t > last_t:
+                    state["fps"] = round(((n - last) & 0xFFFFFFFF) / (t - last_t))
+                last, last_t = n, t
+            p.wait()
+        except OSError:
+            pass
+        state["fps"] = None
+        time.sleep(5)
+
+
+def gpu_thread():
+    # intel_gpu_top -J prints one JSON object per period; split on brace depth.
+    while True:
+        try:
+            p = subprocess.Popen(["intel_gpu_top", "-J", "-s", "1000"], text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            depth, buf = 0, []
+            while True:
+                ch = p.stdout.read(1)
+                if not ch:
+                    break
+                if ch == "{":
+                    depth += 1
+                if depth:
+                    buf.append(ch)
+                if ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            eng = json.loads("".join(buf)).get("engines", {})
+                            busy = [v.get("busy", 0) for k, v in eng.items() if k.startswith("Render")]
+                            state["gpu"] = round(busy[0]) if busy else None
+                        except ValueError:
+                            pass
+                        buf = []
+            p.wait()
+        except OSError:
+            pass
+        state["gpu"] = None
+        time.sleep(30)
+
+
+def cpu_times():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)
+    return sum(v), idle
+
+
+def ram():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            m[k] = int(v.split()[0])
+    total = m["MemTotal"] / 1048576
+    return total - m.get("MemAvailable", m["MemFree"]) / 1048576, total
+
+
+def fmt(v, unit=""):
+    return "n/a" if v is None else f"{v}{unit}"
+
+
+def main():
+    daemon = "--daemon" in sys.argv
+    for fn in (fps_thread, gpu_thread):
+        threading.Thread(target=fn, daemon=True).start()
+    if daemon:
+        os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    t0, i0 = cpu_times()
+    while True:
+        time.sleep(1)
+        t1, i1 = cpu_times()
+        cpu = round(100 * (1 - (i1 - i0) / max(t1 - t0, 1)))
+        t0, i0 = t1, i1
+        used, total = ram()
+        line = (f"FPS {fmt(state['fps'])}  CPU {cpu}%  "
+                f"RAM {used:.1f}/{total:.1f} GB  GPU {fmt(state['gpu'], '%')}")
+        if daemon:
+            with open(OUT + ".new", "w") as f:
+                f.write(line + "\n")
+            os.replace(OUT + ".new", OUT)
+        else:
+            print(line, flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+CN60_PERF_PY_EOF
+
+    put_file /usr/local/lib/cn60/perf-tail 755 <<'EOF'
+#!/bin/sh
+# Feeds waybar one line per second from the stats file written by cn60-perf.service.
+while :; do
+    cat /run/cn60/perf.txt 2>/dev/null || echo "Performance: starting..."
+    sleep 1
+done
+EOF
+
+    put_file /usr/local/lib/cn60/waybar/config 644 <<'EOF'
+{
+    "layer": "overlay",
+    "position": "top",
+    "exclusive": false,
+    "passthrough": true,
+    "modules-right": ["custom/perf"],
+    "custom/perf": {
+        "exec": "/usr/local/lib/cn60/perf-tail",
+        "format": "{}",
+        "tooltip": false
+    }
+}
+EOF
+
+    put_file /usr/local/lib/cn60/waybar/style.css 644 <<'EOF'
+* { border: none; min-height: 0; }
+window#waybar { background: transparent; }
+#custom-perf {
+    font-family: "DejaVu Sans Mono", monospace;
+    font-size: 44px;
+    font-weight: bold;
+    color: #ffffff;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 6px 16px;
+    border-radius: 10px;
+}
+EOF
+
+    put_file /usr/local/lib/cn60/labwc/rc.xml 644 <<'EOF'
+<?xml version="1.0"?>
+<!-- CN60 kiosk with performance overlay: Android full screen, no window borders. -->
+<labwc_config>
+  <core><gap>0</gap></core>
+  <keyboard>
+    <!-- Defining one binding turns off labwc's default shortcuts (Alt+F4 etc.). -->
+    <keybind key="W-F12"><action name="Reconfigure"/></keybind>
+  </keyboard>
+  <windowRules>
+    <windowRule identifier="*" serverDecoration="no">
+      <action name="ToggleFullscreen"/>
+    </windowRule>
+  </windowRules>
+</labwc_config>
+EOF
+
+    put_file /usr/local/lib/cn60/labwc/autostart 644 <<'EOF'
+waybar -c /usr/local/lib/cn60/waybar/config -s /usr/local/lib/cn60/waybar/style.css >/dev/null 2>&1 &
+EOF
+
+    put_file /etc/systemd/system/cn60-perf.service 644 <<'EOF'
+[Unit]
+Description=CN60 performance numbers for the on-screen overlay (sudo cn60-perf)
+After=waydroid-container.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/cn60/perf-collector.py --daemon
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=graphical-kiosk.target
+EOF
+
+    put_file /usr/local/bin/cn60-perf 755 <<'CN60_PERF_EOF'
+#!/usr/bin/env bash
+# CN60 performance overlay: FPS, CPU, RAM and GPU usage on the TV screen.
+# Usage: sudo cn60-perf                  live numbers in this terminal (Ctrl+C to stop)
+#        sudo cn60-perf overlay on|off   show/hide them on the TV (Android restarts)
+#        sudo cn60-perf status
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-perf $*"; exit 1; }
+
+CONF=/etc/cn60/display.conf
+ADDED=/etc/cn60/packages-added
+PKGS=(labwc waybar)
+grep -q GenuineIntel /proc/cpuinfo && PKGS+=(intel-gpu-tools)
+
+overlay_state() { grep -qs '^OVERLAY=1' "$CONF" && echo on || echo off; }
+set_overlay() { touch "$CONF"; sed -i '/^OVERLAY=/d' "$CONF"; echo "OVERLAY=$1" >> "$CONF"; }
+
+overlay_on() {
+    local p missing=()
+    for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+    if (( ${#missing[@]} )); then
+        echo "Installing ${missing[*]}..."
+        if ! apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=600 "${missing[@]}"; then
+            echo "Install failed (no network?). The overlay stays off."; return 1
+        fi
+        for p in "${missing[@]}"; do grep -qsxF "$p" "$ADDED" || echo "$p" >> "$ADDED"; done
+    fi
+    set_overlay 1
+    systemctl enable --now cn60-perf.service
+    systemctl restart waydroid-kiosk.service
+    echo "Overlay on. Android's screen comes back in about a minute with the numbers top right."
+}
+
+overlay_off() {
+    set_overlay 0
+    systemctl disable --now cn60-perf.service 2>/dev/null
+    systemctl restart waydroid-kiosk.service
+    echo "Overlay off. Android's screen comes back in about a minute."
+}
+
+case ${1:-show} in
+    show)    echo "FPS = frames shown per second (0 when the screen is still). Ctrl+C to stop."
+             exec /usr/bin/python3 /usr/local/lib/cn60/perf-collector.py ;;
+    overlay) case ${2:-} in
+                 on)  overlay_on ;;
+                 off) overlay_off ;;
+                 *)   echo "Use: cn60-perf overlay on|off"; exit 1 ;;
+             esac ;;
+    status)  echo "Overlay: $(overlay_state)"
+             cat /run/cn60/perf.txt 2>/dev/null ;;
+    *)       sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
+CN60_PERF_EOF
 
     # Keep a copy of this script on the box, for self-update and uninstall from anywhere.
     put_file /usr/local/lib/cn60/cn60-waydroid-setup.sh 755 < "$SELF"
@@ -1504,9 +1769,17 @@ UID_NUM="$(id -u "$KUSER")"
 echo 'on 0' | timeout 10 cec-client -s -d 1 >/dev/null 2>&1 || true   # best effort, never blocks boot
 
 systemctl start "user@${UID_NUM}.service" || true
+
+# Performance overlay on (sudo cn60-perf overlay on): labwc + waybar instead of cage.
+OVERLAY=0
+[ -r /etc/cn60/display.conf ] && . /etc/cn60/display.conf
+if [ "$OVERLAY" = 1 ] && command -v labwc >/dev/null && command -v waybar >/dev/null; then
+    set -- labwc -C /usr/local/lib/cn60/labwc -S /usr/local/bin/cn60-kiosk-user
+else
+    set -- cage -s -- /usr/local/bin/cn60-kiosk-user
+fi
 exec runuser -u "$KUSER" -- env XDG_RUNTIME_DIR="/run/user/$UID_NUM" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_NUM/bus" \
-    cage -s -- /usr/local/bin/cn60-kiosk-user
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_NUM/bus" "$@"
 EOF
 
     # Runs as the normal user inside cage: start Waydroid and show it fullscreen.
@@ -1538,7 +1811,11 @@ if [ "$(waydroid prop get persist.waydroid.width 2>/dev/null)" != "$WIDTH" ] ||
     waydroid prop set persist.waydroid.width "$WIDTH" &&
         waydroid prop set persist.waydroid.height "$HEIGHT" && start_android
 fi
-exec waydroid show-full-ui
+waydroid show-full-ui
+# show-full-ui returns as soon as Android's screen is up. cage keeps running after that,
+# but labwc (performance overlay) quits when this script ends, so stay alive while
+# Android runs. If Android stops, the kiosk exits and systemd restarts it.
+while waydroid status 2>/dev/null | grep -q 'Session:.*RUNNING'; do sleep 5; done
 EOF
 
     put_file /etc/systemd/system/waydroid-kiosk.service 644 <<'EOF'
@@ -1726,6 +2003,7 @@ Next steps:
   - See the screen on a PC:   sudo cn60-remote
   - Why do apps close?        sudo cn60-crashlog
   - Install Aurora Store:     sudo cn60-apps aurora
+  - Performance numbers:      sudo cn60-perf   (on the TV: sudo cn60-perf overlay on)
   - Self-update settings:     sudo nano /etc/cn60/update.conf
   - Weekly auto-update:       systemctl list-timers cn60-update.timer
   - Reboot to start the kiosk (and apply boot tweaks).
