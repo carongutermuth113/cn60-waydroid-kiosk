@@ -20,7 +20,7 @@ install. Run it again later to add only what is new.
 | **Android** | [Waydroid](https://waydro.id) with the VANILLA image (no Google apps), shown full screen at boot |
 | **Kiosk** | No desktop environment. `cage` (a single-app Wayland compositor) runs Android on tty1 |
 | **ARM apps** | ARM translation (libhoudini on Intel, libndk on AMD) through [casualsnek/waydroid_script](https://github.com/casualsnek/waydroid_script), so ARM-only apps can run |
-| **Display** | Resolution set from a config file: 1080p (default), 4K or 720p |
+| **Display** | Resolution set from a config file: 1080p at 60 Hz (default), 4K or 720p. The HDMI output switches to match |
 | **TV control** | Turns the TV on at boot and has on/standby buttons over HDMI-CEC |
 | **Sound** | PipeWire (or PulseAudio, if already installed) for HDMI and Bluetooth audio |
 | **Bluetooth** | Pair keyboards, mice, gamepads, remotes, headphones and speakers from a menu |
@@ -165,7 +165,7 @@ sudo cn60-settings
 
 | Option | What it does |
 |---|---|
-| `resolution` | 1080p (default), 4K (3840x2160) or 720p. Saves the choice and restarts Android |
+| `resolution` | 1080p at 60 Hz (default, smoothest), 4K (3840x2160, 30 Hz on the CN60) or 720p. Switches the HDMI output and Android, then restarts Android |
 | `perf` | Performance overlay: FPS, CPU, RAM and GPU in the top-right corner of the TV (see below) |
 | `tweaks` | TV tweaks: hide phone apps, scaling (DPI), hide the bottom bar, Android time zone (see below) |
 | `bluetooth` | Scan/pair, status, reconnect, disconnect, forget devices |
@@ -178,6 +178,20 @@ sudo cn60-settings
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
 | `reboot` | Reboot the box |
+
+---
+
+## Resolution and smoothness
+
+The kiosk switches the **HDMI output** to the resolution in `/etc/cn60/display.conf`, at the
+fastest refresh rate the TV offers **up to 60 Hz** (`wlr-randr`). Before v17 only Android's size
+changed and the TV stayed in its preferred mode, often 4K at 30 Hz.
+
+- The CN60's Haswell graphics can only send **4K at 30 Hz** over HDMI, and drawing Android at 4K
+  keeps the GPU at 100%. **1080p at 60 Hz** is twice as smooth and far lighter. Measured on a CN60:
+  4K = 30 FPS max with the GPU maxed out; 1080p = 60 FPS while scrolling, GPU about 80%.
+- If the TV doesn't offer the chosen size, its preferred mode is kept and Android is scaled.
+- After changing the size, `sudo cn60-tweaks density auto` sets matching scaling (1080p → 240).
 
 ---
 
@@ -199,6 +213,7 @@ Or `sudo cn60-settings` → **perf**.
   [labwc](https://labwc.github.io/) instead (same wlroots base, no borders, Android full screen)
   and [waybar](https://github.com/Alexays/Waybar) draws the box. With it off, cage is used as before.
 - The overlay and its stats service (`cn60-perf.service`) cost about 1-2% CPU.
+- The text size follows the resolution (24 px at 1080p, 48 px at 4K).
 
 ---
 

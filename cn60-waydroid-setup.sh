@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=16              # bump when the script changes
+SCRIPT_VERSION=17              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -262,7 +262,7 @@ install_packages() {
     local want=(waydroid lxc dnsmasq-base nftables cage seatd bluez cec-utils whiptail
                 python3-venv python3-pip git curl ca-certificates
                 build-essential dkms "linux-headers-$(uname -r)" linux-headers-amd64
-                zram-tools unattended-upgrades openssh-server)
+                zram-tools unattended-upgrades openssh-server wlr-randr)
     # Sound for Android (HDMI and Bluetooth headphones/speakers) goes through the host's audio server.
     if dpkg -s pulseaudio >/dev/null 2>&1; then
         want+=(pulseaudio-module-bluetooth)
@@ -687,20 +687,23 @@ command -v whiptail >/dev/null || { echo "whiptail missing"; exit 1; }
 apply_resolution() {
     local w="$1" h="$2"
     mkdir -p /etc/cn60
-    printf 'WIDTH=%s\nHEIGHT=%s\n' "$w" "$h" > "$CONF"
+    touch "$CONF"
+    # Keep the other settings in the file (OVERLAY=...); only replace the size.
+    sed -i '/^WIDTH=/d; /^HEIGHT=/d' "$CONF"
+    printf 'WIDTH=%s\nHEIGHT=%s\n' "$w" "$h" >> "$CONF"
     [[ -x /usr/local/bin/cn60-tweaks ]] && /usr/local/bin/cn60-tweaks density-follow >/dev/null 2>&1
     waydroid prop set persist.waydroid.width "$w" || true
     waydroid prop set persist.waydroid.height "$h" || true
     systemctl restart waydroid-kiosk.service
-    whiptail --msgbox "Resolution set to ${w}x${h}. Kiosk restarted." 8 50
+    whiptail --msgbox "Resolution set to ${w}x${h}. Android restarts in about a minute." 8 60
 }
 
 menu_resolution() {
     local choice
-    choice=$(whiptail --title "Resolution" --menu "Choose a display mode" 15 60 5 \
-        1080p "1920x1080 (default)" \
-        4k    "3840x2160" \
-        720p  "1280x720" \
+    choice=$(whiptail --title "Resolution" --menu "The HDMI output switches to this size at the fastest refresh up to 60 Hz. This box can only send 4K at 30 Hz." 16 74 4 \
+        1080p "1920x1080 at 60 Hz (default, smoothest)" \
+        4k    "3840x2160 at 30 Hz (sharper, choppy)" \
+        720p  "1280x720 at 60 Hz" \
         back  "Return" 3>&1 1>&2 2>&3) || return
     case "$choice" in
         4k)    apply_resolution 3840 2160 ;;
@@ -1242,7 +1245,12 @@ EOF
 EOF
 
     put_file /usr/local/lib/cn60/labwc/autostart 644 <<'EOF'
-waybar -c /usr/local/lib/cn60/waybar/config -s /usr/local/lib/cn60/waybar/style.css >/dev/null 2>&1 &
+# Overlay text size follows the resolution: 1080p -> 24px, 4K -> 48px.
+HEIGHT=1080
+[ -r /etc/cn60/display.conf ] && . /etc/cn60/display.conf
+CSS="${XDG_RUNTIME_DIR:-/tmp}/cn60-waybar.css"
+sed "s/font-size: [0-9]*px/font-size: $(( ${HEIGHT:-1080} / 45 ))px/" /usr/local/lib/cn60/waybar/style.css > "$CSS"
+waybar -c /usr/local/lib/cn60/waybar/config -s "$CSS" >/dev/null 2>&1 &
 EOF
 
     put_file /etc/systemd/system/cn60-perf.service 644 <<'EOF'
@@ -1790,6 +1798,26 @@ EOF
 CONF=/etc/cn60/display.conf
 [ -r "$CONF" ] && . "$CONF"
 WIDTH="${WIDTH:-1920}"; HEIGHT="${HEIGHT:-1080}"
+
+# Switch the HDMI output to WIDTHxHEIGHT at the fastest refresh rate up to 60 Hz.
+# Without this the compositor keeps the TV's preferred mode (often 4K at 30 Hz on this
+# box) and only scales Android up, which is both blurry and choppy.
+set_hdmi_mode() {
+    command -v wlr-randr >/dev/null 2>&1 || return 0
+    best=$(wlr-randr 2>/dev/null | awk -v want="${WIDTH}x${HEIGHT}" '
+        /^[^ ]/ { if (out != "") exit; out = $1; next }
+        $1 == want && $2 == "px," {
+            r = $3 + 0
+            if (r <= 60.5 && r > rate) rate = r
+        }
+        END { if (out != "" && rate > 0) printf "%s %s@%f\n", out, want, rate }')
+    [ -n "$best" ] || return 0
+    # shellcheck disable=SC2086
+    set -- $best
+    wlr-randr --output "$1" --mode "$2" >/dev/null 2>&1 || true
+}
+set_hdmi_mode
+
 wait_up() {
     i=0
     while [ "$i" -lt 120 ]; do
