@@ -166,6 +166,7 @@ sudo cn60-settings
 | Option | What it does |
 |---|---|
 | `resolution` | 1080p (default), 4K (3840x2160) or 720p. Saves the choice and restarts Android |
+| `tweaks` | TV tweaks: hide phone apps, scaling (DPI), hide the bottom bar, Android time zone (see below) |
 | `bluetooth` | Scan/pair, status, reconnect, disconnect, forget devices |
 | `tv` | TV on / standby over HDMI-CEC |
 | `info` | IP address and SSH status |
@@ -176,6 +177,25 @@ sudo cn60-settings
 | `check` | Check for a new script version and Debian updates |
 | `update` | Update the script from GitHub, then Debian + Android |
 | `reboot` | Reboot the box |
+
+---
+
+## TV tweaks
+
+Stock Waydroid is a phone image. `sudo cn60-settings` → **tweaks** (or `sudo cn60-tweaks`) makes it fit a TV:
+
+| Command | What it does |
+|---|---|
+| `sudo cn60-tweaks all` | All of the below in one go |
+| `sudo cn60-tweaks apps-remove` | Hides Clock, Contacts, Music, Recorder, Calculator, Calendar and Camera |
+| `sudo cn60-tweaks apps-restore` | Brings them back |
+| `sudo cn60-tweaks density auto` | Scaling that matches the resolution (4K → 480 dpi, 1080p → 240, 720p → 160). Also `density 360`, `density reset` |
+| `sudo cn60-tweaks navbar off` | Hides the bottom bar (`qemu.hw.mainkeys=1` in `waydroid.cfg`). Use the remote's Back and Home keys. `navbar on` shows it again. Restarts Android |
+| `sudo cn60-tweaks timezone` | Sets Android's clock to the box's time zone (or `timezone Europe/Madrid`) |
+| `sudo cn60-tweaks status` | Shows the current state |
+
+Apps are hidden with `pm uninstall --user 0`, so they stay in the Android image and can be restored at any time.
+Changing the resolution in the menu keeps the layout size if you set a scaling before.
 
 ---
 
@@ -452,6 +472,7 @@ edit. Units the script masks, disables or enables are recorded under
 | `/usr/local/bin/cn60-check` | Update checker + Android notification |
 | `/usr/local/bin/cn60-remote` | Remote-screen status and PC commands |
 | `/usr/local/bin/cn60-apps` | Android app installer (Aurora Store, AT4K, any .apk) |
+| `/usr/local/bin/cn60-tweaks` | TV tweaks (hide apps, scaling, bottom bar, time zone) |
 | `/usr/local/bin/cn60-crashlog` | Crash report, saved to `/var/log/cn60-crash-report.txt` |
 | `/cn60.swap`, `/etc/cn60/swapfile` | Swap file and its record for uninstall |
 | `/etc/cn60/options` | Answers to install questions (`AURORA_STORE=yes/no`) |

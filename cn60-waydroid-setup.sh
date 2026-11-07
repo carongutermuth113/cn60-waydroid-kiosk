@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION=14              # bump when the script changes
+SCRIPT_VERSION=15              # bump when the script changes
 STATE=/etc/cn60
 MARK=$STATE/installed          # present once a full install finished
 STEPS=$STATE/steps             # one file per one-time step, holding the step version
@@ -197,7 +197,7 @@ do_uninstall() {
     rm -f /usr/local/bin/cn60-kiosk-start /usr/local/bin/cn60-kiosk-user \
           /usr/local/bin/cn60-settings /usr/local/bin/cn60-update \
           /usr/local/bin/cn60-check /usr/local/bin/cn60-remote /usr/local/bin/cn60-apps \
-          /usr/local/bin/cn60-crashlog /etc/update-motd.d/90-cn60
+          /usr/local/bin/cn60-crashlog /usr/local/bin/cn60-tweaks /etc/update-motd.d/90-cn60
     rm -rf /usr/local/lib/cn60 /var/lib/cn60 /etc/systemd/system/waydroid-container.service.d/90-cn60.conf
 
     log "Reverting OS tweaks"
@@ -675,7 +675,7 @@ write_helpers() {
     # Settings menu (embedded, so this script is the only file you need).
     put_file /usr/local/bin/cn60-settings 755 <<'CN60_SETTINGS_EOF'
 #!/usr/bin/env bash
-# CN60 settings menu: resolution, Bluetooth, TV power (HDMI-CEC), SSH info, updates.
+# CN60 settings menu: resolution, TV tweaks, Bluetooth, TV power (HDMI-CEC), SSH info, updates.
 # Written by cn60-waydroid-setup.sh. Run with sudo from a console.
 set -uo pipefail
 
@@ -687,6 +687,7 @@ apply_resolution() {
     local w="$1" h="$2"
     mkdir -p /etc/cn60
     printf 'WIDTH=%s\nHEIGHT=%s\n' "$w" "$h" > "$CONF"
+    [[ -x /usr/local/bin/cn60-tweaks ]] && /usr/local/bin/cn60-tweaks density-follow >/dev/null 2>&1
     waydroid prop set persist.waydroid.width "$w" || true
     waydroid prop set persist.waydroid.height "$h" || true
     systemctl restart waydroid-kiosk.service
@@ -801,11 +802,47 @@ menu_tv_power() {
     esac
 }
 
+# TV tweaks (cn60-tweaks): hide phone apps, scaling, bottom bar, time zone.
+tw_run() { clear; /usr/local/bin/cn60-tweaks "$@"; read -rp "Press Enter to continue " _; }
+
+menu_tweaks() {
+    local choice v
+    while true; do
+        choice=$(whiptail --title "TV tweaks" --menu "$(/usr/local/bin/cn60-tweaks status 2>&1 | head -n 4)" 21 74 8 \
+            all      "Do all of the below (recommended for a TV)" \
+            apps     "Hide phone apps (Clock, Contacts, Music, Camera...)" \
+            restore  "Bring the hidden apps back" \
+            scale    "Size of text and icons (scaling)" \
+            navbar   "Hide or show the bottom bar" \
+            timezone "Set Android's clock to this box's time zone" \
+            back     "Return" 3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            all)      tw_run all ;;
+            apps)     tw_run apps-remove ;;
+            restore)  tw_run apps-restore ;;
+            scale)    v=$(whiptail --title "Scaling" --menu "Bigger number = bigger text and icons" 17 64 7 \
+                          auto  "Match the resolution (recommended)" \
+                          160   "720p normal" \
+                          240   "1080p normal" \
+                          360   "4K small" \
+                          480   "4K normal" \
+                          560   "4K large" \
+                          reset "Android default" 3>&1 1>&2 2>&3) && tw_run density "$v" ;;
+            navbar)   v=$(whiptail --title "Bottom bar" --menu "Without the bar, use the remote's Back and Home keys. Android restarts." 12 64 2 \
+                          off "Hide the bottom bar" \
+                          on  "Show the bottom bar" 3>&1 1>&2 2>&3) && tw_run navbar "$v" ;;
+            timezone) tw_run timezone ;;
+            back)     return ;;
+        esac
+    done
+}
+
 while true; do
     status_line=$(cat /etc/cn60/status 2>/dev/null)
     choice=$(whiptail --title "CN60 Settings (script v$(cat /etc/cn60/version 2>/dev/null))" \
-        --menu "${status_line:-Everything is up to date.}" 23 70 12 \
+        --menu "${status_line:-Everything is up to date.}" 24 70 13 \
         resolution "Change display resolution" \
+        tweaks     "TV tweaks: hide apps, scaling, bottom bar, clock" \
         bluetooth  "Bluetooth devices" \
         tv         "TV power on/off (CEC)" \
         info       "IP address and SSH" \
@@ -819,6 +856,7 @@ while true; do
         exit       "Quit" 3>&1 1>&2 2>&3) || break
     case "$choice" in
         resolution) menu_resolution ;;
+        tweaks)     menu_tweaks ;;
         bluetooth)  menu_bluetooth ;;
         tv)         menu_tv_power ;;
         info)       menu_info ;;
@@ -835,6 +873,181 @@ while true; do
     esac
 done
 CN60_SETTINGS_EOF
+
+    # TV tweaks: hide phone apps, UI scaling (DPI), bottom bar, Android time zone.
+    put_file /usr/local/bin/cn60-tweaks 755 <<'CN60_TWEAKS_EOF'
+#!/usr/bin/env bash
+# CN60 TV tweaks for Android: hide stock phone apps, UI scaling (DPI), hide the bottom
+# navigation bar, and set Android's time zone. Written by cn60-waydroid-setup.sh.
+# Usage: sudo cn60-tweaks status|all|apps-remove|apps-restore|density <dpi|auto|reset>
+#                         |navbar <off|on>|timezone [Area/City]
+set -uo pipefail
+[[ $EUID -eq 0 ]] || { echo "Run with sudo: sudo cn60-tweaks $*"; exit 1; }
+
+CFG=/var/lib/waydroid/waydroid.cfg
+BACKUP=/etc/cn60/backup
+KUSER="$(cat /etc/cn60/user 2>/dev/null || echo tv)"
+# Stock apps that make little sense on a TV. "pm uninstall --user 0" hides them for the
+# user only: they stay in the Android image and "cn60-tweaks apps-restore" brings them back.
+APPS=(com.android.deskclock:Clock com.android.contacts:Contacts org.lineageos.eleven:Music
+      org.lineageos.recorder:Recorder com.android.calculator2:Calculator
+      org.lineageos.etar:Calendar org.lineageos.aperture:Camera)
+
+ash() { waydroid shell -- "$@" 2>&1 | tr -d '\r'; }
+
+need_android() {
+    if [[ $(waydroid status 2>/dev/null) != *Session:*RUNNING* ]]; then
+        echo "Android is not running. Start it with: sudo systemctl restart waydroid-kiosk"
+        echo "then wait a minute and try again."
+        exit 1
+    fi
+}
+
+# Read the package list once into a variable: "ash ... | grep -q" would race with
+# pipefail (grep exits early, the writer gets SIGPIPE, the test randomly fails).
+PKGS=""
+load_pkgs() { PKGS=$(ash /system/bin/pm list packages); }
+installed() { [[ $'\n'"$PKGS"$'\n' == *$'\n'"package:$1"$'\n'* ]]; }
+
+apps_remove() {
+    local e pkg name out
+    load_pkgs
+    for e in "${APPS[@]}"; do
+        pkg=${e%%:*}; name=${e#*:}
+        if installed "$pkg"; then
+            out=$(ash /system/bin/pm uninstall --user 0 "$pkg")
+            [[ $out == *Success* ]] && echo "  hidden: $name" || echo "  FAILED: $name ($out)"
+        else
+            echo "  already hidden: $name"
+        fi
+    done
+}
+
+apps_restore() {
+    local e pkg name out
+    load_pkgs
+    for e in "${APPS[@]}"; do
+        pkg=${e%%:*}; name=${e#*:}
+        if installed "$pkg"; then echo "  already there: $name"; continue; fi
+        out=$(ash /system/bin/pm install-existing --user 0 "$pkg")
+        [[ $out == *installed* || $out == *Success* ]] && echo "  restored: $name" || echo "  FAILED: $name ($out)"
+    done
+}
+
+# Density that gives a 1280x720-sized layout (about right from a sofa) at the configured
+# resolution: 4K -> 480, 1080p -> 240, 720p -> 160.
+auto_dpi() {
+    local HEIGHT=1080
+    # shellcheck disable=SC1091
+    [[ -r /etc/cn60/display.conf ]] && . /etc/cn60/display.conf
+    echo $(( ${HEIGHT:-1080} * 2 / 9 ))
+}
+
+density() {
+    local v=${1:-auto}
+    [[ $v == auto ]] && v=$(auto_dpi)
+    if [[ $v == reset ]]; then
+        ash /system/bin/wm density reset >/dev/null
+        echo "  scaling: Android default"
+    elif [[ $v =~ ^[0-9]+$ ]] && (( v >= 100 && v <= 800 )); then
+        ash /system/bin/wm density "$v" >/dev/null
+        echo "  scaling: $v dpi"
+    else
+        echo "Density must be a number from 100 to 800, 'auto' or 'reset'."; return 1
+    fi
+}
+
+# After a resolution change: keep the layout size, but only if a density was chosen before.
+density_follow() {
+    [[ $(ash /system/bin/wm density) == *'Override density'* ]] && density auto
+    return 0
+}
+
+# The bottom bar is hidden with the qemu.hw.mainkeys=1 property ("this device has hardware
+# keys"). It lives in waydroid.cfg [properties], so it survives "waydroid upgrade".
+navbar() {
+    local want=$1 out
+    [[ $want == off || $want == on ]] || { echo "Use: cn60-tweaks navbar off|on"; return 1; }
+    [[ -f $CFG ]] || { echo "$CFG missing; is Waydroid installed?"; return 1; }
+    out="$(python3 - "$CFG" "$want" <<'PY'
+import configparser, sys
+path, want = sys.argv[1], sys.argv[2]
+c = configparser.ConfigParser()
+c.read(path)
+if not c.has_section("properties"):
+    c.add_section("properties")
+cur = c.get("properties", "qemu.hw.mainkeys", fallback=None)
+if want == "off" and cur != "1":
+    c.set("properties", "qemu.hw.mainkeys", "1")
+elif want == "on" and cur is not None:
+    c.remove_option("properties", "qemu.hw.mainkeys")
+else:
+    sys.exit(0)
+with open(path + ".cn60new", "w") as f:
+    c.write(f)
+print("changed")
+PY
+)" || { rm -f "$CFG.cn60new"; echo "Could not edit $CFG."; return 1; }
+    if [[ $out != changed ]]; then
+        echo "  bottom bar: already $want"; return 0
+    fi
+    local b="$BACKUP$CFG"
+    [[ -e $b ]] || { mkdir -p "$(dirname "$b")"; cp -a "$CFG" "$b"; }
+    mv -f "$CFG.cn60new" "$CFG"
+    echo "  bottom bar: $want (restarting Android, about a minute)"
+    # Android saves app changes (hidden apps) about 10 s after they are made; stopping it
+    # sooner loses them. Give it time if it is running.
+    [[ $(waydroid status 2>/dev/null) == *Session:*RUNNING* ]] && sleep 15
+    systemctl stop waydroid-kiosk.service 2>/dev/null || true
+    runuser -u "$KUSER" -- waydroid session stop >/dev/null 2>&1 || true
+    waydroid upgrade --offline >/dev/null 2>&1 || echo "  WARNING: waydroid upgrade --offline failed"
+    systemctl restart waydroid-container.service
+    systemctl start waydroid-kiosk.service
+}
+
+timezone() {
+    local tz=${1:-}
+    [[ -n $tz ]] || tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    [[ -n $tz ]] || tz=$(cat /etc/timezone 2>/dev/null)
+    if [[ -z $tz || ! -f /usr/share/zoneinfo/$tz ]]; then
+        echo "Unknown time zone '${tz}'. Example: cn60-tweaks timezone America/New_York"; return 1
+    fi
+    ash /system/bin/settings put global auto_time_zone 0 >/dev/null
+    ash /system/bin/cmd alarm set-timezone "$tz" >/dev/null
+    if [[ $(ash /system/bin/getprop persist.sys.timezone) == "$tz" ]]; then
+        echo "  time zone: $tz (Android now shows $(ash /system/bin/date '+%H:%M'))"
+    else
+        echo "  FAILED to set the time zone to $tz"; return 1
+    fi
+}
+
+status() {
+    local e hidden=() d mk tz
+    load_pkgs
+    for e in "${APPS[@]}"; do installed "${e%%:*}" || hidden+=("${e#*:}"); done
+    d=$(ash /system/bin/wm density | sed -n 's/Override density: //p')
+    mk=$(ash /system/bin/getprop qemu.hw.mainkeys)
+    tz=$(ash /system/bin/getprop persist.sys.timezone)
+    echo "Hidden apps: ${hidden[*]:-none}"
+    echo "Scaling:     ${d:-Android default} dpi (suggested $(auto_dpi))"
+    echo "Bottom bar:  $([[ $mk == 1 ]] && echo hidden || echo shown)"
+    echo "Time zone:   ${tz:-unset} (box: $(timedatectl show -p Timezone --value 2>/dev/null))"
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+    status)        need_android; status ;;
+    apps-remove)   need_android; apps_remove ;;
+    apps-restore)  need_android; apps_restore ;;
+    density)       need_android; density "${1:-auto}" ;;
+    density-follow) need_android; density_follow ;;
+    timezone)      need_android; timezone "${1:-}" ;;
+    navbar)        navbar "${1:-}" ;;
+    all)           need_android
+                   apps_remove; density auto; timezone; navbar off ;;
+    *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
+CN60_TWEAKS_EOF
 
     # Keep a copy of this script on the box, for self-update and uninstall from anywhere.
     put_file /usr/local/lib/cn60/cn60-waydroid-setup.sh 755 < "$SELF"
